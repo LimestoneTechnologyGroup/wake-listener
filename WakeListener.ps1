@@ -15,7 +15,7 @@
 
 param([switch]$Test)
 
-$Version = "3.2.1"
+$Version = "3.3.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrases       = @("hey tyrone", "okay tyrone", "hi tyrone", "ok tyrone")   # what to say, lowercase
@@ -218,6 +218,7 @@ function Show-Meter {
   $level = [WakeListenerAudio.DefaultMicrophone]::Level()
   if ($level -gt $script:loudest) { $script:loudest = $level }
   if ($level -gt $script:windowLoudest) { $script:windowLoudest = $level }
+  if ($level -gt $script:soundSinceEvent) { $script:soundSinceEvent = $level }
   $state = if ($level -lt 0) { "no microphone" } elseif ($level -ge 8) { "hearing sound" } else { "quiet" }
   $shown = [Math]::Max(0, $level)
   $bars = [Math]::Round($shown / 100 * 30)
@@ -328,8 +329,38 @@ $quietWarned = $false
 $rank = @{ High = 3; Medium = 2; Low = 1; Rejected = 0 }
 $nextMicCheck = Get-Date
 $restartAt = $null
+# While the assistant is open it has the microphone: the listener steps back,
+# and starts a fresh session when it closes (a Bluetooth mic's audio changes
+# under a session that kept running through the call, leaving it deaf).
+$handedOver = $false
+$nextWindowCheck = Get-Date
+# Watchdog: sound on the mic but no word from the speech engine for a minute means it's stuck.
+$script:lastEventAt = Get-Date
+$script:soundSinceEvent = 0
 
 while (-not $script:quit) {
+  # Every second: is the assistant open? Step back while it is; listen afresh when it closes.
+  if ((Get-Date) -ge $nextWindowCheck) {
+    $nextWindowCheck = (Get-Date).AddSeconds(1)
+    $open = (Test-AssistantOpen) -or (((Get-Date) - $last).TotalSeconds -lt $GraceSecs)
+    if ($open -and -not $handedOver) {
+      $handedOver = $true
+      Stop-Session $recognizer; $recognizer = $null
+      Say "The assistant is open: not listening until it closes." DarkGray
+      $script:lastHeard = "assistant open"; Set-TrayText
+    } elseif (-not $open -and $handedOver) {
+      $handedOver = $false
+      Say "The assistant closed: listening again."
+      $script:lastHeard = (Get-Date -Format "HH:mm") + " last call"; Set-TrayText
+      $restartAt = Get-Date
+    }
+  }
+  if ($handedOver) {
+    $item = $null; while ([WakeListenerSpeech.Continuous]::Heard.TryDequeue([ref]$item)) { }
+    [System.Windows.Forms.Application]::DoEvents(); Show-Meter; Start-Sleep -Milliseconds 100
+    continue
+  }
+
   # Every few seconds: follow the default microphone, (re)starting on it whenever it changes.
   if ((Get-Date) -ge $nextMicCheck -or ($restartAt -and (Get-Date) -ge $restartAt)) {
     $nextMicCheck = (Get-Date).AddSeconds(3)
@@ -351,6 +382,7 @@ while (-not $script:quit) {
           $script:micName = $mic.Name; Set-TrayText
           $host.UI.RawUI.WindowTitle = "Wake listener: listening on " + $mic.Name
           $since = Get-Date; $script:loudest = 0; $script:windowLoudest = 0; $quietWarned = $false
+          $script:lastEventAt = Get-Date; $script:soundSinceEvent = 0
         } catch {
           $why = $_.Exception; while ($why.InnerException) { $why = $why.InnerException }
           if ($why.HResult -eq -2147199735) { Say "Windows' speech privacy setting is blocking it: turn on Settings > Privacy & security > Speech > Online speech recognition. Trying again shortly." Yellow }
@@ -365,6 +397,7 @@ while (-not $script:quit) {
   # What it heard (and whether listening stopped), from the helper's queue.
   $item = $null
   while ([WakeListenerSpeech.Continuous]::Heard.TryDequeue([ref]$item)) {
+    $script:lastEventAt = Get-Date; $script:soundSinceEvent = 0
     $parts = $item.Split("|", 4)
     if ($parts[0] -eq "completed") {
       # Listening stopped by itself: say why if it matters, and start again in a moment.
@@ -394,8 +427,20 @@ while (-not $script:quit) {
       Say ("Heard `"" + $text + "`" ($pct): opening the assistant.") Cyan
       $script:lastHeard = (Get-Date -Format "HH:mm") + " opened"; Set-TrayText
       $last = Get-Date
+      # Let go of the microphone first, so the assistant gets it cleanly.
+      Stop-Session $recognizer; $recognizer = $null
+      $handedOver = $true
+      Say "The assistant is open: not listening until it closes." DarkGray
       try { Open-Assistant } catch { Say ("Couldn't open the assistant: " + $_.Exception.Message) Red }
+      break
     }
+  }
+  if ($handedOver) { continue }
+
+  # Watchdog: sound on the mic for a minute but no word from the speech engine: it's stuck, so start afresh.
+  if ($recognizer -and ((Get-Date) - $script:lastEventAt).TotalSeconds -ge 60) {
+    if ($script:soundSinceEvent -ge 15) { Say "Hearing sound but the speech engine has gone quiet: restarting listening." DarkYellow; $restartAt = Get-Date }
+    $script:lastEventAt = Get-Date; $script:soundSinceEvent = 0
   }
 
   # Silent too long: say so once (the meter should move when you talk).
