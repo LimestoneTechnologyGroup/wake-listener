@@ -7,7 +7,7 @@ It's a plain PowerShell script, not an exe: Windows' own offline speech recogniz
 ## Install
 
 1. Download **[WakeListener.zip](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest/download/WakeListener.zip)**, right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents.
-2. Double-click **Start wake listener.cmd**. A minimized PowerShell window opens and says it's listening. (If Windows asks about running it, choose **Run**.)
+2. Double-click **Start wake listener.cmd**. A small PowerShell window opens (minimized) showing which microphone it's listening on, a live mic level meter, everything it hears, and any problem with the sound. It follows you if you change your default microphone. (If Windows asks about running it, choose **Run**.)
 3. Say **"hey assistant"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
 
 **Start with Windows:** press Win+R, type `shell:startup`, press Enter, and put a shortcut to **Start wake listener.cmd** in that folder.
