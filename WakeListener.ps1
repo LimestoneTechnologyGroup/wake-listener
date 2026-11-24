@@ -74,31 +74,19 @@ try {
   exit 1
 }
 
-# A click in the window would start text selection, which pauses the script until
-# Esc. Turn that off for this window only, so a stray click can't stop it listening.
-try {
-  Add-Type -Namespace WakeListener -Name Console -MemberDefinition @'
-[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int which);
-[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr handle, out uint mode);
-[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr handle, uint mode);
-'@
-  $in = [WakeListener.Console]::GetStdHandle(-10)
-  $mode = 0
-  if ([WakeListener.Console]::GetConsoleMode($in, [ref]$mode)) {
-    [void][WakeListener.Console]::SetConsoleMode($in, ($mode -band (-bnot 0x40)) -bor 0x80)   # QuickEdit off (extended flags on)
-  }
-} catch { }
-
 $host.UI.RawUI.WindowTitle = "Wake listener: say `"$($Phrases[0])`""
 Write-Host "Wake listener is on. Say `"$($Phrases[0])`" and your assistant opens." -ForegroundColor Green
-Write-Host "Minimize this window; close it to stop listening."
+Write-Host "Minimize this window, without clicking inside it (a click pauses it until you press Esc)."
+Write-Host "Close it to stop listening."
 Write-Host ""
 
 $last = [datetime]::MinValue
 while ($true) {
   $r = $engine.Recognize([TimeSpan]::FromSeconds(30))
-  if (-not $r -or $r.Grammar.Name -ne "wake") { continue }
+  if (-not $r) { continue }
   $when = Get-Date -Format "HH:mm:ss"
+  # Any other speech: shows the microphone is working (the words aren't shown or kept).
+  if ($r.Grammar.Name -ne "wake") { Write-Host "$when  Heard talking, not the phrase." -ForegroundColor DarkGray; continue }
   $sure = [math]::Round($r.Confidence, 2)
   if ($r.Confidence -lt $MinConfidence) { Write-Host "$when  Heard `"$($r.Text)`" ($sure): too unsure, ignored."; continue }
   if (((Get-Date) - $last).TotalSeconds -lt $CooldownSecs) { Write-Host "$when  Heard `"$($r.Text)`" ($sure): just opened, ignored."; continue }
