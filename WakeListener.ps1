@@ -14,14 +14,18 @@
 
 param([switch]$Test)
 
-$Version = "2.1.0"
+$Version = "2.2.0"
 
 # ---- Settings ---------------------------------------------------------------
-$Phrases       = @("hey assistant", "okay assistant")   # what to say, lowercase
+$Phrases       = @("hey assistant", "okay assistant", "hi assistant", "ok assistant")   # what to say, lowercase
 $Url           = "https://project-checkin.dev.limestonetg.com/assistant?start=voice"
 $Browser       = "edge-app"   # edge-app, chrome-app, or default
-$MinConfidence = 0.5          # raise it if it opens by mistake; lower it if it misses you
+$MinConfidence = 0.4          # raise it if it opens by mistake; lower it if it misses you
 $CooldownSecs  = 45           # ignore the phrase this long after opening
+# Close enough: what the engine often writes down instead ("hey assistance",
+# "okay assistants", "hay assistant"), when it takes the phrase for ordinary talk.
+$CloseEnough   = '^(?:(?:hey|hay|hi|high|okay|ok|a|eh|hey there)\s+)?(?:assistant|assistants|assistance|assistant''s|assist)$'
+$CloseEnoughMin = 0.3         # how sure the engine must be of a close-enough phrase
 # -----------------------------------------------------------------------------
 
 Add-Type -AssemblyName System.Speech
@@ -100,8 +104,25 @@ $other = New-Object System.Speech.Recognition.DictationGrammar
 $other.Name = "other"
 $engine.LoadGrammar($other)
 
+# Did it hear the phrase? The exact phrase, or something close enough, in its
+# best guess or any of its second guesses. Returns the matching guess, or $null.
+function Find-Wake($result) {
+  if (-not $result) { return $null }
+  $guesses = @($result)
+  try { $guesses += @($result.Alternates) } catch { }
+  foreach ($g in $guesses) {
+    if (-not $g) { continue }
+    if ($g.Grammar -and $g.Grammar.Name -eq "wake" -and $g.Confidence -ge $MinConfidence) { return $g }
+    # Close enough: a short utterance (the phrase on its own), never a sentence that mentions "assistant".
+    $words = (($g.Text.ToLowerInvariant() -replace "[^a-z' ]", " ") -replace "\s+", " ").Trim()
+    if ($words -match $CloseEnough -and $g.Confidence -ge $CloseEnoughMin) { return $g }
+  }
+  return $null
+}
+
 # The engine reports what it hears, the sound level and sound problems as events, queued here.
 $null = Register-ObjectEvent -InputObject $engine -EventName SpeechRecognized -SourceIdentifier WL.Heard
+$null = Register-ObjectEvent -InputObject $engine -EventName SpeechRecognitionRejected -SourceIdentifier WL.Unsure
 $null = Register-ObjectEvent -InputObject $engine -EventName AudioLevelUpdated -SourceIdentifier WL.Level
 $null = Register-ObjectEvent -InputObject $engine -EventName AudioSignalProblemOccurred -SourceIdentifier WL.Problem
 $null = Register-ObjectEvent -InputObject $engine -EventName RecognizeCompleted -SourceIdentifier WL.Stopped
@@ -109,11 +130,12 @@ $null = Register-ObjectEvent -InputObject $engine -EventName RecognizeCompleted 
 if ($Test) {
   $engine.SetInputToNull()
   $ok = $true
-  foreach ($p in $Phrases + @("send the budget to finance")) {
-    $r = $engine.EmulateRecognize($p)
-    $hit = $r -and $r.Grammar.Name -eq "wake"
-    $want = $Phrases -contains $p
-    Write-Host ("{0,-9} {1}" -f $(if ($hit) { "match" } else { "ignored" }), $p)
+  $opens = $Phrases + @("hey assistance", "okay assistants", "hay assistant", "assistant")
+  $ignores = @("send the budget to finance", "the assistant manager called", "my assistant is out today", "hey how are you")
+  foreach ($p in $opens + $ignores) {
+    $hit = [bool](Find-Wake ($engine.EmulateRecognize($p)))
+    $want = $opens -contains $p
+    Write-Host ("{0,-9} {1}{2}" -f $(if ($hit) { "opens" } else { "ignored" }), $p, $(if ($hit -ne $want) { "   <-- WRONG" } else { "" }))
     $ok = $ok -and ($hit -eq $want)
   }
   # The event path the live window uses.
@@ -204,20 +226,25 @@ while ($true) {
           if ($words[$p]) { Say $words[$p] Yellow }
         }
       }
-      "WL.Heard" {
+      { $_ -eq "WL.Heard" -or $_ -eq "WL.Unsure" } {
         $r = $e.SourceEventArgs.Result
-        $sure = "{0:0}%" -f ($r.Confidence * 100)
-        if ($r.Grammar.Name -ne "wake") {
-          $said = $r.Text; if ($said.Length -gt 50) { $said = $said.Substring(0, 50) + "..." }
+        $hit = Find-Wake $r
+        $said = if ($r -and $r.Text) { $r.Text } else { "" }
+        if ($said.Length -gt 50) { $said = $said.Substring(0, 50) + "..." }
+        if ($hit) {
+          $how = if ($hit.Grammar -and $hit.Grammar.Name -eq "wake") { "" } else { ", close enough" }
+          $sure = "{0:0}%" -f ($hit.Confidence * 100)
+          if (((Get-Date) - $last).TotalSeconds -lt $CooldownSecs) {
+            Say ("Heard `"" + $hit.Text + "`" ($sure$how): just opened it, ignored.") DarkGray
+          } else {
+            Say ("Heard `"" + $hit.Text + "`" ($sure$how): opening the assistant.") Cyan
+            $last = Get-Date
+            try { Open-Assistant } catch { Say ("Couldn't open the assistant: " + $_.Exception.Message) Red }
+          }
+        } elseif ($r -and $r.Grammar -and $r.Grammar.Name -eq "wake") {
+          Say ("Heard `"" + $r.Text + "`" but only " + ("{0:0}%" -f ($r.Confidence * 100)) + " sure: ignored. Say it again, a little clearer.") Yellow
+        } elseif ($said) {
           Say ("Heard `"" + $said + "`": not the phrase.") DarkGray
-        } elseif ($r.Confidence -lt $MinConfidence) {
-          Say ("Heard `"" + $r.Text + "`" but only $sure sure: ignored. Say it again, a little clearer.") Yellow
-        } elseif (((Get-Date) - $last).TotalSeconds -lt $CooldownSecs) {
-          Say ("Heard `"" + $r.Text + "`" ($sure): just opened it, ignored.") DarkGray
-        } else {
-          Say ("Heard `"" + $r.Text + "`" ($sure): opening the assistant.") Cyan
-          $last = Get-Date
-          try { Open-Assistant } catch { Say ("Couldn't open the assistant: " + $_.Exception.Message) Red }
         }
       }
     }
