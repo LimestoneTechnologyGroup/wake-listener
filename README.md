@@ -2,12 +2,12 @@
 
 Say **"hey assistant"** (or "okay assistant") and your Project Check-in assistant opens and starts talking.
 
-It's a plain PowerShell script, not an exe: Windows' own offline speech recognizer listens on your default microphone. Nothing is recorded or sent anywhere until you say the phrase.
+It's a plain PowerShell script, not an exe. Since 3.0 it uses Windows 10/11's built-in speech recognizer (Windows.Media.SpeechRecognition), listening only for a short list of phrases on your default microphone. Nothing is recorded or sent anywhere.
 
 ## Install
 
 1. Download **[WakeListener.zip](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest/download/WakeListener.zip)**, right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents.
-2. Double-click **Start wake listener.cmd**. A small PowerShell window opens (minimized) showing which microphone it's listening on, a live mic level meter, everything it hears, and any problem with the sound. It follows you if you change your default microphone. (If Windows asks about running it, choose **Run**.)
+2. Double-click **Start wake listener.cmd**. A small PowerShell window opens (minimized) showing which microphone it's listening on, a live mic level meter (Windows' own meter for that microphone), everything it hears and why it did or didn't open, and any problem with the microphone. It follows you if you change your default microphone. (If Windows asks about running it, choose **Run**.)
 3. Say **"hey assistant"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
 
 **Start with Windows:** press Win+R, type `shell:startup`, press Enter, and put a shortcut to **Start wake listener.cmd** in that folder.
