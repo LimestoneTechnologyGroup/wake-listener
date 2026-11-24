@@ -1,8 +1,8 @@
 // Wake listener: a tray app that listens (on this PC, offline) for a wake
 // phrase such as "hey assistant" and opens the assistant's voice page, which
 // starts the conversation by itself. No audio leaves the computer: Windows'
-// built-in speech recognizer does the listening. Settings are in
-// wake-listener.ini beside the exe.
+// built-in speech recognizer does the listening. It runs from wherever the
+// exe is; its settings and log are in %LOCALAPPDATA%\WakeListener.
 //
 // Built with the C# compiler that ships with Windows (.NET Framework 4), so
 // C# 5: no string interpolation or expression-bodied members.
@@ -20,51 +20,32 @@ using System.Windows.Forms;
 
 static class Program
 {
-    public static readonly string InstallDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WakeListener");
-    public static readonly string InstalledExe = Path.Combine(InstallDir, "WakeListener.exe");
-    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    /// <summary>
+    /// "Start with Windows" is a plain shortcut in the user's Startup folder,
+    /// made only when they tick it in the tray menu. The app never copies
+    /// itself anywhere or writes a Run key (1.0.0 did both, and Defender's
+    /// behaviour check took it for malware setting itself up to persist).
+    /// </summary>
+    static string StartupShortcut { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "Wake listener.lnk"); } }
 
-    /// <summary>Starts with Windows (the current user's Run key), or not.</summary>
+    public static bool StartsWithWindows() { return File.Exists(StartupShortcut); }
+
     public static void SetStartup(bool on)
     {
-        using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey))
-        {
-            if (on) key.SetValue("WakeListener", "\"" + InstalledExe + "\"");
-            else key.DeleteValue("WakeListener", false);
-        }
-    }
-
-    public static bool StartsWithWindows()
-    {
-        using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey))
-            return key != null && key.GetValue("WakeListener") != null;
+        if (!on) { if (File.Exists(StartupShortcut)) File.Delete(StartupShortcut); return; }
+        var shellType = Type.GetTypeFromProgID("WScript.Shell");
+        var shell = Activator.CreateInstance(shellType);
+        var link = shellType.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { StartupShortcut });
+        var t = link.GetType();
+        t.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, link, new object[] { Application.ExecutablePath });
+        t.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, link, new object[] { Path.GetDirectoryName(Application.ExecutablePath) });
+        t.InvokeMember("Description", System.Reflection.BindingFlags.SetProperty, null, link, new object[] { "Listens for your wake phrase and opens the assistant" });
+        t.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, link, null);
     }
 
     [STAThread]
     static void Main(string[] args)
     {
-        var here = Path.GetFullPath(Application.ExecutablePath);
-        // Run from a download: install into the user's own folder (no admin), start with Windows, and run from there.
-        if (!args.Contains("--test") && !string.Equals(here, InstalledExe, StringComparison.OrdinalIgnoreCase))
-        {
-            try
-            {
-                Directory.CreateDirectory(InstallDir);
-                foreach (var old in Process.GetProcessesByName("WakeListener"))
-                {
-                    if (old.Id == Process.GetCurrentProcess().Id) continue;
-                    try { old.Kill(); old.WaitForExit(3000); } catch { }
-                }
-                File.Copy(here, InstalledExe, true);
-                SetStartup(true);
-                Process.Start(new ProcessStartInfo(InstalledExe, "--welcome") { WorkingDirectory = InstallDir });
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("The wake listener couldn't install itself: " + ex.Message, "Wake listener", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-            return;
-        }
         bool created;
         using (var one = new Mutex(true, "Local\\LimestoneWakeListener", out created))
         {
@@ -73,10 +54,22 @@ static class Program
             var settings = Settings.Load();
             if (args.Contains("--test"))
             {
-                Environment.ExitCode = Listener.SelfTest(settings) ? 0 : 1;
+                var ok = Listener.SelfTest(settings);
+                // The Start with Windows toggle, both ways, leaving it as it was.
+                var before = StartsWithWindows();
+                try
+                {
+                    SetStartup(true); var on = StartsWithWindows();
+                    SetStartup(false); var off = !StartsWithWindows();
+                    SetStartup(before);
+                    Settings.Log("Self-test: start with Windows " + (on && off ? "toggles" : "DID NOT TOGGLE"));
+                    ok &= on && off;
+                }
+                catch (Exception ex) { Settings.Log("Self-test: start with Windows failed: " + ex.Message); ok = false; }
+                Environment.ExitCode = ok ? 0 : 1;
                 return;
             }
-            Application.Run(new TrayApp(settings, args.Contains("--welcome")));
+            Application.Run(new TrayApp(settings, Settings.FirstRun));
         }
     }
 }
@@ -88,8 +81,10 @@ class Settings
     public string Browser = "edge-app";
     public float Confidence = 0.7f;
     public int CooldownSeconds = 45;
-    public static readonly string Folder = AppDomain.CurrentDomain.BaseDirectory;
+    public static readonly string Folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WakeListener");
     public static readonly string LogFile = Path.Combine(Folder, "wake-listener.log");
+    /// <summary>True the first time it runs on this PC (no settings file yet): it says hello.</summary>
+    public static bool FirstRun;
 
     public static Settings Load()
     {
@@ -97,7 +92,8 @@ class Settings
         var path = Path.Combine(Folder, "wake-listener.ini");
         if (!File.Exists(path))
         {
-            try { File.WriteAllText(path, DefaultIni); } catch { }
+            FirstRun = true;
+            try { Directory.CreateDirectory(Folder); File.WriteAllText(path, DefaultIni); } catch { }
             return s;
         }
         foreach (var raw in File.ReadAllLines(path))
@@ -256,7 +252,7 @@ class TrayApp : ApplicationContext
             listener.Heard += (phrase, confidence) => ui.Post(_ => OnHeard(phrase, confidence), null);
             listener.Start();
             Settings.Log("Started. Listening for " + string.Join(", ", settings.Phrases) + " (confidence " + settings.Confidence + ").");
-            if (welcome) tray.ShowBalloonTip(8000, "Wake listener is on", "Say " + said + " and your assistant opens. It starts with Windows; right-click this icon to pause it or change settings.", ToolTipIcon.Info);
+            if (welcome) tray.ShowBalloonTip(8000, "Wake listener is on", "Say " + said + " and your assistant opens. To have it start with Windows, right-click this icon and tick Start with Windows.", ToolTipIcon.Info);
         }
         catch (Exception ex)
         {
