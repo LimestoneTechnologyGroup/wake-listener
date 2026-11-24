@@ -1,9 +1,9 @@
 ﻿# Wake listener: say "hey Tyrone" and your Project Check-in assistant opens.
 #
-# Plain PowerShell, no exe. It uses Windows 10/11's built-in speech recognizer
-# (the newer one, Windows.Media.SpeechRecognition), listening only for a short
-# list of phrases, on this PC: nothing is recorded or sent anywhere. When it
-# hears the phrase, it opens the assistant's voice page, which starts talking.
+# Plain PowerShell, no exe. Windows' built-in speech recognizer listens for a
+# short list of phrases on your default microphone, on this PC, whatever window
+# is in front: nothing is recorded or sent anywhere. When it hears the phrase,
+# it opens the assistant's voice page, which starts talking.
 #
 # The window shows what's going on: which microphone, a live level meter
 # (Windows' own meter for that microphone), and everything it hears and why it
@@ -15,15 +15,18 @@
 
 param([switch]$Test)
 
-$Version = "3.3.0"
+$Version = "4.0.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrases       = @("hey tyrone", "okay tyrone", "hi tyrone", "ok tyrone")   # what to say, lowercase
 $Url           = "https://project-checkin.dev.limestonetg.com/assistant?start=voice&close=1"   # close=1: the window closes itself once the conversation is saved
 $Browser       = "edge-app"   # edge-app, chrome-app, or default
-# How sure Windows must be: High, Medium or Low (its own verdict). Low opens on
-# anything it didn't reject; raise it to Medium if it ever opens by mistake.
+# How sure it must be: High, Medium or Low. Low opens on anything it didn't
+# reject; raise it to Medium if it ever opens by mistake.
 $MinVerdict    = "Low"
+# Close enough: what the recognizer often writes down instead ("hey tyron",
+# "a tyrone"), when said on their own.
+$CloseEnough   = '^(?:(?:hey|hay|hi|high|okay|ok|a|eh)\s+)?(?:tyrone|tyron|tyrones|tyrone''s|ty rone)$'
 # While the assistant's window is open, the phrase is ignored (so it never opens
 # twice); it's found by its title. Also ignored for a few seconds after opening,
 # while the page loads and has no title yet.
@@ -32,48 +35,205 @@ $GraceSecs     = 15
 # -----------------------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$null = [Windows.Media.SpeechRecognition.SpeechRecognizer, Windows.Media.SpeechRecognition, ContentType = WindowsRuntime]
 
-# Windows' async calls, waited for from PowerShell. While waiting, $During runs every 120 ms (the level meter).
-$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq "AsTask" -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } | Select-Object -First 1
-function Wait-Windows($operation, [Type]$type, [scriptblock]$During) {
-  $task = $asTask.MakeGenericMethod($type).Invoke($null, @($operation))
-  while (-not $task.Wait(120)) { if ($During) { & $During } }
-  return $task.Result
-}
-$asTaskAction = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq "AsTask" -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' } | Select-Object -First 1
-function Wait-WindowsAction($action) { $task = $asTaskAction.Invoke($null, @($action)); $null = $task.Wait(10000) }
-
-# Continuous listening keeps the microphone open all the time (no gaps, and a
-# Bluetooth mic's audio link stays up). Its results arrive as Windows events,
-# which PowerShell can't subscribe to, so a few lines of C# collect them into a
-# queue this script reads. Built once with Windows' own C# compiler into the
-# user's temp folder, and rebuilt only when this code changes.
-$speechHelper = @'
+# The listening engine: Windows' classic speech recognizer (System.Speech), which
+# keeps listening whatever window is in front (Windows' newer recognizer only
+# hears a desktop program while its window has the focus). It's fed straight
+# from the Windows default microphone, the same one the level meter reads.
+# Results go into a queue this script reads: "result|verdict|score|words" and
+# "completed|why". C# because the recognizer reports from its own threads.
+Add-Type -AssemblyName System.Speech
+Add-Type -ReferencedAssemblies System.Speech -Language CSharp @'
+using System;
 using System.Collections.Concurrent;
-using Windows.Media.SpeechRecognition;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Speech.AudioFormat;
+using System.Speech.Recognition;
+using System.Text.RegularExpressions;
+using System.Threading;
+
 namespace WakeListenerSpeech {
   public static class Continuous {
     public static readonly ConcurrentQueue<string> Heard = new ConcurrentQueue<string>();
-    public static void Attach(SpeechRecognizer r) {
-      r.ContinuousRecognitionSession.ResultGenerated += (s, e) => Heard.Enqueue("result|" + e.Result.Confidence + "|" + e.Result.RawConfidence.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" + e.Result.Text);
-      r.ContinuousRecognitionSession.Completed += (s, e) => Heard.Enqueue("completed|" + e.Status);
+    static SpeechRecognitionEngine engine;
+    static MicStream mic;
+    static Regex closeEnough;
+
+    static SpeechRecognitionEngine Build(string[] phrases, string closeEnoughPattern) {
+      var culture = SpeechRecognitionEngine.InstalledRecognizers().Select(r => r.Culture).FirstOrDefault(c => c.Name == "en-US")
+        ?? SpeechRecognitionEngine.InstalledRecognizers().Select(r => r.Culture).First();
+      var e = new SpeechRecognitionEngine(culture);
+      e.LoadGrammar(new Grammar(new GrammarBuilder(new Choices(phrases)) { Culture = culture }) { Name = "wake" });
+      // Free dictation beside the phrases: ordinary talk lands there instead of
+      // being forced onto the nearest phrase, so it opens by mistake less often.
+      e.LoadGrammar(new DictationGrammar { Name = "other" });
+      closeEnough = new Regex(closeEnoughPattern, RegexOptions.IgnoreCase);
+      e.SpeechRecognized += (s, a) => Report(a.Result, false);
+      e.SpeechRecognitionRejected += (s, a) => Report(a.Result, true);
+      e.RecognizeCompleted += (s, a) => Heard.Enqueue("completed|" + (a.Error != null ? "Error: " + a.Error.Message : a.Cancelled ? "UserCanceled" : "Success"));
+      return e;
     }
+
+    static string Verdict(float c) { return c >= 0.75f ? "High" : c >= 0.5f ? "Medium" : c >= 0.2f ? "Low" : "Rejected"; }
+    static string Score(float c) { return c.ToString("0.00", CultureInfo.InvariantCulture); }
+    static string Words(string t) { return Regex.Replace(Regex.Replace((t ?? "").ToLowerInvariant(), "[^a-z' ]", " "), "\\s+", " ").Trim(); }
+
+    /// <summary>The phrase (or something close enough), in its best guess or any second guess.</summary>
+    static string Judge(RecognitionResult r, bool rejected) {
+      if (r == null) return "result|Rejected|0|";
+      var guesses = new List<RecognizedPhrase> { r };
+      try { guesses.AddRange(r.Alternates); } catch { }
+      foreach (var g in guesses) {
+        if (g == null) continue;
+        if (g.Grammar != null && g.Grammar.Name == "wake" && g.Confidence >= 0.2f) return "result|" + Verdict(g.Confidence) + "|" + Score(g.Confidence) + "|" + g.Text;
+        if (closeEnough.IsMatch(Words(g.Text)) && g.Confidence >= 0.2f) return "result|Low|" + Score(g.Confidence) + "|" + g.Text;
+      }
+      return "result|Rejected|" + Score(r.Confidence) + "|";
+    }
+    static void Report(RecognitionResult r, bool rejected) { Heard.Enqueue(Judge(r, rejected)); }
+
+    /// <summary>Starts listening on the default microphone. Throws why not.</summary>
+    public static void Start(string[] phrases, string closeEnoughPattern) {
+      Stop();
+      engine = Build(phrases, closeEnoughPattern);
+      mic = new MicStream();
+      engine.SetInputToAudioStream(mic, new SpeechAudioFormatInfo(MicStream.Rate, AudioBitsPerSample.Sixteen, AudioChannel.Mono));
+      engine.RecognizeAsync(RecognizeMode.Multiple);
+    }
+
+    public static void Stop() {
+      var e = engine; var m = mic; engine = null; mic = null;
+      if (e != null) { try { e.RecognizeAsyncCancel(); } catch { } }
+      if (m != null) { try { m.Close(); } catch { } }
+      if (e != null) { try { e.Dispose(); } catch { } }
+    }
+
+    /// <summary>For the self-test: what it makes of these words, said on their own (no microphone).</summary>
+    public static string Try(string[] phrases, string closeEnoughPattern, string words) {
+      using (var e = Build(phrases, closeEnoughPattern)) {
+        e.SetInputToNull();
+        var r = e.EmulateRecognize(words);
+        while (Heard.Count > 0) { string x; Heard.TryDequeue(out x); }
+        return Judge(r, r == null);
+      }
+    }
+  }
+
+  /// <summary>
+  /// The Windows default microphone as a live 16 kHz, 16-bit mono stream (waveIn
+  /// on the default-device mapper). Read waits until sound arrives, as the
+  /// recognizer expects of a live source.
+  /// </summary>
+  public class MicStream : Stream {
+    public const int Rate = 16000;
+    const int BufferBytes = Rate * 2 / 10;
+    const int Buffers = 8;
+    [StructLayout(LayoutKind.Sequential)] struct WaveFormat { public ushort wFormatTag, nChannels; public uint nSamplesPerSec, nAvgBytesPerSec; public ushort nBlockAlign, wBitsPerSample, cbSize; }
+    [StructLayout(LayoutKind.Sequential)] struct WaveHdr { public IntPtr lpData; public uint dwBufferLength, dwBytesRecorded; public IntPtr dwUser; public uint dwFlags, dwLoops; public IntPtr lpNext, reserved; }
+    [DllImport("winmm.dll")] static extern int waveInOpen(out IntPtr h, uint device, ref WaveFormat format, IntPtr callback, IntPtr instance, uint flags);
+    [DllImport("winmm.dll")] static extern int waveInPrepareHeader(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveInUnprepareHeader(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveInAddBuffer(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveInStart(IntPtr h);
+    [DllImport("winmm.dll")] static extern int waveInReset(IntPtr h);
+    [DllImport("winmm.dll")] static extern int waveInClose(IntPtr h);
+    static readonly int HdrSize = Marshal.SizeOf(typeof(WaveHdr));
+    readonly IntPtr device;
+    readonly IntPtr[] headers = new IntPtr[Buffers];
+    readonly AutoResetEvent signal = new AutoResetEvent(false);
+    readonly Queue<byte[]> ready = new Queue<byte[]>();
+    readonly object gate = new object();
+    readonly Thread pump;
+    byte[] current; int offset;
+    volatile bool closed;
+
+    public MicStream() {
+      var format = new WaveFormat { wFormatTag = 1, nChannels = 1, nSamplesPerSec = Rate, wBitsPerSample = 16, nBlockAlign = 2, nAvgBytesPerSec = Rate * 2 };
+      var result = waveInOpen(out device, 0xFFFFFFFF, ref format, signal.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, 0x50000);
+      if (result != 0) throw new IOException("The microphone couldn't be opened (waveIn error " + result + ").");
+      for (var i = 0; i < Buffers; i++) {
+        var hdr = new WaveHdr { lpData = Marshal.AllocHGlobal(BufferBytes), dwBufferLength = BufferBytes };
+        headers[i] = Marshal.AllocHGlobal(HdrSize);
+        Marshal.StructureToPtr(hdr, headers[i], false);
+        waveInPrepareHeader(device, headers[i], HdrSize);
+        waveInAddBuffer(device, headers[i], HdrSize);
+      }
+      pump = new Thread(Pump) { IsBackground = true, Name = "Microphone" };
+      pump.Start();
+      waveInStart(device);
+    }
+
+    void Pump() {
+      while (!closed) {
+        signal.WaitOne(500);
+        for (var i = 0; i < Buffers && !closed; i++) {
+          var hdr = (WaveHdr)Marshal.PtrToStructure(headers[i], typeof(WaveHdr));
+          if ((hdr.dwFlags & 1) == 0) continue;
+          if (hdr.dwBytesRecorded > 0) {
+            var data = new byte[hdr.dwBytesRecorded];
+            Marshal.Copy(hdr.lpData, data, 0, data.Length);
+            lock (gate) { ready.Enqueue(data); if (ready.Count > 300) ready.Dequeue(); Monitor.PulseAll(gate); }
+          }
+          waveInUnprepareHeader(device, headers[i], HdrSize);
+          hdr.dwFlags = 0; hdr.dwBytesRecorded = 0;
+          Marshal.StructureToPtr(hdr, headers[i], false);
+          waveInPrepareHeader(device, headers[i], HdrSize);
+          waveInAddBuffer(device, headers[i], HdrSize);
+        }
+      }
+    }
+
+    public override int Read(byte[] buffer, int start, int count) {
+      var copied = 0;
+      while (copied < count) {
+        if (current == null || offset >= current.Length) {
+          lock (gate) {
+            while (ready.Count == 0 && !closed) Monitor.Wait(gate, 500);
+            if (ready.Count == 0) return copied;
+            current = ready.Dequeue(); offset = 0;
+          }
+        }
+        var n = Math.Min(count - copied, current.Length - offset);
+        Buffer.BlockCopy(current, offset, buffer, start + copied, n);
+        offset += n; copied += n;
+      }
+      return copied;
+    }
+
+    public override void Close() {
+      if (closed) return;
+      closed = true;
+      lock (gate) Monitor.PulseAll(gate);
+      waveInReset(device);
+      if (pump != null) pump.Join(1000);
+      for (var i = 0; i < Buffers; i++) {
+        if (headers[i] == IntPtr.Zero) continue;
+        waveInUnprepareHeader(device, headers[i], HdrSize);
+        var hdr = (WaveHdr)Marshal.PtrToStructure(headers[i], typeof(WaveHdr));
+        Marshal.FreeHGlobal(hdr.lpData);
+        Marshal.FreeHGlobal(headers[i]);
+        headers[i] = IntPtr.Zero;
+      }
+      waveInClose(device);
+      base.Close();
+    }
+
+    public override bool CanRead { get { return true; } }
+    public override bool CanSeek { get { return false; } }
+    public override bool CanWrite { get { return false; } }
+    public override long Length { get { throw new NotSupportedException(); } }
+    public override long Position { get { return 0; } set { } }
+    public override void Flush() { }
+    public override long Seek(long o, SeekOrigin s) { throw new NotSupportedException(); }
+    public override void SetLength(long v) { throw new NotSupportedException(); }
+    public override void Write(byte[] b, int o, int c) { throw new NotSupportedException(); }
   }
 }
 '@
-$fw = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319"
-$helperHash = [BitConverter]::ToString((New-Object System.Security.Cryptography.SHA256Managed).ComputeHash([Text.Encoding]::UTF8.GetBytes($speechHelper))).Replace("-", "").Substring(0, 12)
-$helperDll = Join-Path $env:TEMP "WakeListenerSpeech-$helperHash.dll"
-if (-not (Test-Path $helperDll)) {
-  $helperCs = Join-Path $env:TEMP "WakeListenerSpeech-$helperHash.cs"
-  Set-Content $helperCs $speechHelper -Encoding UTF8
-  $refs = @("$env:WINDIR\System32\WinMetadata\Windows.Media.winmd", "$env:WINDIR\System32\WinMetadata\Windows.Foundation.winmd", "$fw\System.Runtime.WindowsRuntime.dll", "$fw\System.Runtime.dll", "$fw\System.Runtime.InteropServices.WindowsRuntime.dll", "$fw\System.Threading.Tasks.dll")
-  $built = & (Join-Path $fw "csc.exe") /nologo /target:library "/out:$helperDll" ($refs | ForEach-Object { "/reference:$_" }) $helperCs 2>&1
-  if ($LASTEXITCODE -ne 0) { throw "The listening helper couldn't be built: $built" }
-}
-Add-Type -Path $helperDll
 
 # Windows' default recording device: its name and id, and its live level, from the Core Audio API.
 Add-Type -Language CSharp @'
@@ -157,41 +317,26 @@ function Get-Microphone {
   return [pscustomobject]@{ Id = $d.Substring(0, $i); Name = $d.Substring($i + 1) }
 }
 
-# A recognizer that listens only for the phrases. Returns it, or throws why not.
-function New-Recognizer {
-  $r = New-Object Windows.Media.SpeechRecognition.SpeechRecognizer
-  $list = New-Object Windows.Media.SpeechRecognition.SpeechRecognitionListConstraint(([string[]]$Phrases), "wake")
-  # PowerShell can't call Add on this Windows collection directly; call it through .NET's interface.
-  $null = [System.Collections.Generic.ICollection[Windows.Media.SpeechRecognition.ISpeechRecognitionConstraint]].GetMethod("Add").Invoke($r.Constraints.psobject.BaseObject, [object[]]@($list.psobject.BaseObject))
-  $compiled = Wait-Windows ($r.CompileConstraintsAsync()) ([Windows.Media.SpeechRecognition.SpeechRecognitionCompilationResult])
-  if ($compiled.Status -ne "Success") { throw "Windows couldn't set up the phrases ($($compiled.Status))." }
-  $r.Timeouts.BabbleTimeout = [TimeSpan]::FromSeconds(4)
-  $r.Timeouts.EndSilenceTimeout = [TimeSpan]::FromMilliseconds(300)
-  # Never stop for silence: it listens until told to stop.
-  $r.ContinuousRecognitionSession.AutoStopSilenceTimeout = [TimeSpan]::FromDays(7)
-  [WakeListenerSpeech.Continuous]::Attach($r)
-  return $r
-}
-
-# Starts continuous listening; results arrive in the helper's queue.
-function Start-Session($r) { Wait-WindowsAction ($r.ContinuousRecognitionSession.StartAsync()) }
-function Stop-Session($r) { if ($r) { try { Wait-WindowsAction ($r.ContinuousRecognitionSession.CancelAsync()) } catch { }; try { $r.Dispose() } catch { } } }
+# Listening on and off. (The loop calls these: New-Recognizer, then Start-Session; Stop-Session.)
+function New-Recognizer { return "classic" }
+function Start-Session($r) { [WakeListenerSpeech.Continuous]::Start([string[]]$Phrases, $CloseEnough) }
+function Stop-Session($r) { if ($r) { try { [WakeListenerSpeech.Continuous]::Stop() } catch { } } }
 
 if ($Test) {
   $ok = $true
-  "speech language: " + [Windows.Media.SpeechRecognition.SpeechRecognizer]::SystemSpeechLanguage.LanguageTag
-  try { $r = New-Recognizer; "phrases: ready (" + ($Phrases -join ", ") + ")" } catch { "phrases: FAILED " + $_.Exception.Message; $ok = $false }
+  $opens = $Phrases + @("hey tyron", "a tyrone", "hey tyrone's")
+  $ignores = @("send the budget to finance", "tyrone called about the permit yesterday", "hey how are you", "turn on the lights")
+  foreach ($p in $opens + $ignores) {
+    $verdict = ([WakeListenerSpeech.Continuous]::Try([string[]]$Phrases, $CloseEnough, $p)).Split("|")[1]
+    $hit = $verdict -ne "Rejected"
+    $want = $opens -contains $p
+    "{0,-9} {1}{2}" -f $(if ($hit) { "opens" } else { "ignored" }), $p, $(if ($hit -ne $want) { "   <-- WRONG" } else { "" })
+    $ok = $ok -and ($hit -eq $want)
+  }
   $mic = Get-Microphone
   "microphone: " + $(if ($mic) { $mic.Name + ", level " + [WakeListenerAudio.DefaultMicrophone]::Level() } else { "none on this PC" })
-  if ($r) {
-    try {
-      Start-Session $r
-      Start-Sleep -Seconds 3
-      $item = $null; $seen = @(); while ([WakeListenerSpeech.Continuous]::Heard.TryDequeue([ref]$item)) { $seen += $item }
-      "continuous listening: started" + $(if ($seen) { "; events: " + ($seen -join ", ") } else { "; listening, no events yet" })
-      Stop-Session $r
-    } catch { "continuous listening: FAILED " + $_.Exception.Message; $ok = $false }
-  }
+  try { Start-Session "classic"; Start-Sleep -Seconds 2; Stop-Session "classic"; "listening: started and stopped" }
+  catch { $why = $_.Exception; while ($why.InnerException) { $why = $why.InnerException }; "listening: " + $why.Message + $(if (-not $mic) { " (expected: no microphone here)" } else { "" }); if ($mic) { $ok = $false } }
   if ($ok) { exit 0 } else { exit 1 }
 }
 
@@ -309,7 +454,7 @@ function Notify([string]$text) {
 function Idle([int]$ms) { $until = (Get-Date).AddMilliseconds($ms); while ((Get-Date) -lt $until -and -not $script:quit) { [System.Windows.Forms.Application]::DoEvents(); Show-Meter; Start-Sleep -Milliseconds 100 } }
 
 Clear-Host
-Write-Host "Wake listener $Version (Windows speech recognizer)" -ForegroundColor White
+Write-Host "Wake listener $Version" -ForegroundColor White
 Write-Host ("Say " + (($Phrases | Select-Object -First 2 | ForEach-Object { "`"$_`"" }) -join " or ") + " and your assistant opens (when Windows' verdict is $MinVerdict or better).")
 Write-Host "Opens: $Url"
 Write-Host "This window hides itself: the tray icon by the clock keeps listening, whatever window is in front."

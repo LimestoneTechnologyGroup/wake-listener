@@ -1,8 +1,8 @@
-﻿# Wake listener
+# Wake listener
 
 Say **"hey Tyrone"** (or "okay Tyrone") and your Project Check-in assistant opens and starts talking.
 
-It's a plain PowerShell script, not an exe. Since 3.0 it uses Windows 10/11's built-in speech recognizer (Windows.Media.SpeechRecognition), listening only for a short list of phrases on your default microphone. Nothing is recorded or sent anywhere.
+It's a plain PowerShell script, not an exe. Windows' built-in speech recognizer listens for a short list of phrases on your default microphone, whatever window is in front. Nothing is recorded or sent anywhere.
 
 ## Install
 
