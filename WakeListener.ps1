@@ -1,4 +1,4 @@
-﻿# Wake listener: say "hey assistant" and your Project Check-in assistant opens.
+﻿# Wake listener: say "hey Tyrone" and your Project Check-in assistant opens.
 #
 # Plain PowerShell, no exe. It uses Windows 10/11's built-in speech recognizer
 # (the newer one, Windows.Media.SpeechRecognition), listening only for a short
@@ -15,16 +15,20 @@
 
 param([switch]$Test)
 
-$Version = "3.1.0"
+$Version = "3.2.0"
 
 # ---- Settings ---------------------------------------------------------------
-$Phrases       = @("hey assistant", "okay assistant", "hi assistant", "ok assistant")   # what to say, lowercase
+$Phrases       = @("hey tyrone", "okay tyrone", "hi tyrone", "ok tyrone")   # what to say, lowercase
 $Url           = "https://project-checkin.dev.limestonetg.com/assistant?start=voice"
 $Browser       = "edge-app"   # edge-app, chrome-app, or default
 # How sure Windows must be: High, Medium or Low (its own verdict). Low opens on
 # anything it didn't reject; raise it to Medium if it ever opens by mistake.
 $MinVerdict    = "Low"
-$CooldownSecs  = 45           # ignore the phrase this long after opening
+# While the assistant's window is open, the phrase is ignored (so it never opens
+# twice); it's found by its title. Also ignored for a few seconds after opening,
+# while the page loads and has no title yet.
+$AssistantTitle = "Assistant ·"
+$GraceSecs     = 15
 # -----------------------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
@@ -231,6 +235,40 @@ Add-Type -Namespace WakeListenerWindow -Name Native -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int show);
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
 '@
+# Is the assistant open? A visible Edge or Chrome window whose title contains $AssistantTitle.
+Add-Type -Language CSharp @'
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace WakeListenerWindows {
+  public static class Browser {
+    delegate bool EnumProc(IntPtr window, IntPtr param);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc proc, IntPtr param);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr window, StringBuilder text, int max);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    public static bool HasWindow(string titlePart) {
+      bool found = false;
+      EnumWindows((w, p) => {
+        if (!IsWindowVisible(w)) return true;
+        var text = new StringBuilder(512);
+        GetWindowText(w, text, text.Capacity);
+        if (text.ToString().IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) < 0) return true;
+        uint pid; GetWindowThreadProcessId(w, out pid);
+        try {
+          var name = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant();
+          if (name == "msedge" || name == "chrome") { found = true; return false; }
+        } catch { }
+        return true;
+      }, IntPtr.Zero);
+      return found;
+    }
+  }
+}
+'@
+function Test-AssistantOpen { try { [WakeListenerWindows.Browser]::HasWindow($AssistantTitle) } catch { $false } }
+
 $script:consoleWindow = [WakeListenerWindow.Native]::GetConsoleWindow()
 $script:windowShown = $true
 function Set-WindowShown([bool]$show) {
@@ -346,8 +384,10 @@ while (-not $script:quit) {
       Say "Heard talking, not the phrase." DarkGray
     } elseif ($rank[$verdict] -lt $rank[$MinVerdict]) {
       Say ("Heard something like `"" + $text + "`" ($pct): not sure enough, ignored. Say it again, a little clearer.") DarkYellow
-    } elseif (((Get-Date) - $last).TotalSeconds -lt $CooldownSecs) {
-      Say ("Heard `"" + $text + "`" ($pct): just opened it, ignored.") DarkGray
+    } elseif (((Get-Date) - $last).TotalSeconds -lt $GraceSecs) {
+      Say ("Heard `"" + $text + "`" ($pct): it's opening now, ignored.") DarkGray
+    } elseif (Test-AssistantOpen) {
+      Say ("Heard `"" + $text + "`" ($pct): the assistant is already open, ignored. Close it to call it again.") DarkGray
     } elseif ($script:paused) {
       Say ("Heard `"" + $text + "`" ($pct): paused, so not opening.") DarkGray
     } else {
