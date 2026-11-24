@@ -15,13 +15,15 @@
 
 param([switch]$Test)
 
-$Version = "3.0.0"
+$Version = "3.0.1"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrases       = @("hey assistant", "okay assistant", "hi assistant", "ok assistant")   # what to say, lowercase
 $Url           = "https://project-checkin.dev.limestonetg.com/assistant?start=voice"
 $Browser       = "edge-app"   # edge-app, chrome-app, or default
-$MinConfidence = 0.5          # 0 to 1: raise it if it opens by mistake; lower it if it misses you
+# How sure Windows must be: High, Medium or Low (its own verdict). Low opens on
+# anything it didn't reject; raise it to Medium if it ever opens by mistake.
+$MinVerdict    = "Low"
 $CooldownSecs  = 45           # ignore the phrase this long after opening
 # -----------------------------------------------------------------------------
 
@@ -164,6 +166,7 @@ $script:loudest = 0
 function Show-Meter {
   $level = [WakeListenerAudio.DefaultMicrophone]::Level()
   if ($level -gt $script:loudest) { $script:loudest = $level }
+  if ($level -gt $script:windowLoudest) { $script:windowLoudest = $level }
   $state = if ($level -lt 0) { "no microphone" } elseif ($level -ge 8) { "hearing sound" } else { "quiet" }
   $shown = [Math]::Max(0, $level)
   $bars = [Math]::Round($shown / 100 * 30)
@@ -174,7 +177,7 @@ function Show-Meter {
 
 Clear-Host
 Write-Host "Wake listener $Version (Windows speech recognizer)" -ForegroundColor White
-Write-Host ("Say " + (($Phrases | Select-Object -First 2 | ForEach-Object { "`"$_`"" }) -join " or ") + " and your assistant opens (when it's at least {0:0}% sure)." -f ($MinConfidence * 100))
+Write-Host ("Say " + (($Phrases | Select-Object -First 2 | ForEach-Object { "`"$_`"" }) -join " or ") + " and your assistant opens (when Windows' verdict is $MinVerdict or better).")
 Write-Host "Opens: $Url"
 Write-Host "Don't click inside this window: a click pauses it until you press Esc. Close it to stop."
 Write-Host ""
@@ -226,9 +229,9 @@ while ($true) {
 
   # Silent too long: say so once (the meter should move when you talk).
   if (((Get-Date) - $since).TotalSeconds -ge 20) {
-    if ($script:loudest -lt 2 -and -not $quietWarned) { Say ("No sound at all from " + $mic.Name + ": check it isn't muted (Settings > System > Sound > Input) and that it's the microphone you're using.") Yellow; $quietWarned = $true }
-    if ($script:loudest -ge 2) { $quietWarned = $false }
-    $script:loudest = 0; $since = Get-Date
+    if ($script:windowLoudest -lt 2 -and -not $quietWarned) { Say ("No sound at all from " + $mic.Name + " for 20 seconds: check its mute button and its input volume (Settings > System > Sound > Input).") Yellow; $quietWarned = $true }
+    if ($script:windowLoudest -ge 2) { $quietWarned = $false }
+    $script:windowLoudest = 0; $since = Get-Date
   }
 
   switch ([string]$heard.Status) {
@@ -239,12 +242,15 @@ while ($true) {
     default { Say ("Listening issue: " + $heard.Status + ". Starting again.") Yellow; $recognizer = $null; Start-Sleep -Seconds 2; continue }
   }
 
-  $sure = $heard.RawConfidence
-  $pct = "{0:0}%" -f ($sure * 100)
-  if (-not $heard.Text -or [string]$heard.Confidence -eq "Rejected") {
+  # Windows' verdict (High, Medium, Low, Rejected), its raw score, and how loud the mic got while you spoke.
+  $verdict = [string]$heard.Confidence
+  $rank = @{ High = 3; Medium = 2; Low = 1; Rejected = 0 }
+  $pct = "{0} verdict, {1:0}% raw, mic peak {2}" -f $verdict.ToLowerInvariant(), ($heard.RawConfidence * 100), $script:loudest
+  $script:loudest = 0
+  if (-not $heard.Text -or $verdict -eq "Rejected") {
     Say "Heard talking, not the phrase." DarkGray
-  } elseif ($sure -lt $MinConfidence) {
-    Say ("Heard something like `"" + $heard.Text + "`" but only $pct sure: ignored. Say it again, a little clearer.") Yellow
+  } elseif ($rank[$verdict] -lt $rank[$MinVerdict]) {
+    Say ("Heard something like `"" + $heard.Text + "`" ($pct): not sure enough, ignored. Say it again, a little clearer.") Yellow
   } elseif (((Get-Date) - $last).TotalSeconds -lt $CooldownSecs) {
     Say ("Heard `"" + $heard.Text + "`" ($pct): just opened it, ignored.") DarkGray
   } else {
