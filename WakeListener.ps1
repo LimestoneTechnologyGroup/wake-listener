@@ -15,11 +15,11 @@
 
 param([switch]$Test)
 
-$Version = "3.2.0"
+$Version = "3.2.1"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrases       = @("hey tyrone", "okay tyrone", "hi tyrone", "ok tyrone")   # what to say, lowercase
-$Url           = "https://project-checkin.dev.limestonetg.com/assistant?start=voice"
+$Url           = "https://project-checkin.dev.limestonetg.com/assistant?start=voice&close=1"   # close=1: the window closes itself once the conversation is saved
 $Browser       = "edge-app"   # edge-app, chrome-app, or default
 # How sure Windows must be: High, Medium or Low (its own verdict). Low opens on
 # anything it didn't reject; raise it to Medium if it ever opens by mistake.
