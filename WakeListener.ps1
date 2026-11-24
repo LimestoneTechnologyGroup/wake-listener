@@ -15,7 +15,7 @@
 
 param([switch]$Test)
 
-$Version = "4.0.0"
+$Version = "4.0.1"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrases       = @("hey tyrone", "okay tyrone", "hi tyrone", "ok tyrone")   # what to say, lowercase
@@ -97,10 +97,13 @@ namespace WakeListenerSpeech {
     static void Report(RecognitionResult r, bool rejected) { Heard.Enqueue(Judge(r, rejected)); }
 
     /// <summary>Starts listening on the default microphone. Throws why not.</summary>
-    public static void Start(string[] phrases, string closeEnoughPattern) {
+    public static void Start(string[] phrases, string closeEnoughPattern) { Begin(phrases, closeEnoughPattern, false); }
+    /// <summary>For the self-test: the same start-up, fed silence instead of a microphone.</summary>
+    public static void StartSilent(string[] phrases, string closeEnoughPattern) { Begin(phrases, closeEnoughPattern, true); }
+    static void Begin(string[] phrases, string closeEnoughPattern, bool silent) {
       Stop();
       engine = Build(phrases, closeEnoughPattern);
-      mic = new MicStream();
+      mic = new MicStream(silent);
       engine.SetInputToAudioStream(mic, new SpeechAudioFormatInfo(MicStream.Rate, AudioBitsPerSample.Sixteen, AudioChannel.Mono));
       engine.RecognizeAsync(RecognizeMode.Multiple);
     }
@@ -149,9 +152,18 @@ namespace WakeListenerSpeech {
     readonly object gate = new object();
     readonly Thread pump;
     byte[] current; int offset;
+    long position;
     volatile bool closed;
+    readonly bool silent;
 
-    public MicStream() {
+    public MicStream(bool silent) {
+      this.silent = silent;
+      if (silent) {
+        // The self-test: 100 ms of silence every 100 ms, through the same Read the recognizer uses.
+        pump = new Thread(() => { while (!closed) { Thread.Sleep(100); lock (gate) { ready.Enqueue(new byte[BufferBytes]); if (ready.Count > 300) ready.Dequeue(); Monitor.PulseAll(gate); } } }) { IsBackground = true, Name = "Silence" };
+        pump.Start();
+        return;
+      }
       var format = new WaveFormat { wFormatTag = 1, nChannels = 1, nSamplesPerSec = Rate, wBitsPerSample = 16, nBlockAlign = 2, nAvgBytesPerSec = Rate * 2 };
       var result = waveInOpen(out device, 0xFFFFFFFF, ref format, signal.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, 0x50000);
       if (result != 0) throw new IOException("The microphone couldn't be opened (waveIn error " + result + ").");
@@ -201,6 +213,7 @@ namespace WakeListenerSpeech {
         Buffer.BlockCopy(current, offset, buffer, start + copied, n);
         offset += n; copied += n;
       }
+      position += copied;
       return copied;
     }
 
@@ -208,6 +221,7 @@ namespace WakeListenerSpeech {
       if (closed) return;
       closed = true;
       lock (gate) Monitor.PulseAll(gate);
+      if (silent) { if (pump != null) pump.Join(1000); base.Close(); return; }
       waveInReset(device);
       if (pump != null) pump.Join(1000);
       for (var i = 0; i < Buffers; i++) {
@@ -225,12 +239,14 @@ namespace WakeListenerSpeech {
     public override bool CanRead { get { return true; } }
     public override bool CanSeek { get { return false; } }
     public override bool CanWrite { get { return false; } }
-    public override long Length { get { throw new NotSupportedException(); } }
-    public override long Position { get { return 0; } set { } }
+    // A live source has no end and can't be rewound. The recognizer asks anyway,
+    // and gives up on "not supported", so answer like a never-ending stream.
+    public override long Length { get { return -1; } }
+    public override long Position { get { return position; } set { } }
     public override void Flush() { }
-    public override long Seek(long o, SeekOrigin s) { throw new NotSupportedException(); }
-    public override void SetLength(long v) { throw new NotSupportedException(); }
-    public override void Write(byte[] b, int o, int c) { throw new NotSupportedException(); }
+    public override long Seek(long o, SeekOrigin s) { return position; }
+    public override void SetLength(long v) { }
+    public override void Write(byte[] b, int o, int c) { }
   }
 }
 '@
@@ -335,6 +351,14 @@ if ($Test) {
   }
   $mic = Get-Microphone
   "microphone: " + $(if ($mic) { $mic.Name + ", level " + [WakeListenerAudio.DefaultMicrophone]::Level() } else { "none on this PC" })
+  # The real start-up path, fed silence (this is what failed in 4.0.0 on a PC with a mic).
+  try {
+    [WakeListenerSpeech.Continuous]::StartSilent([string[]]$Phrases, $CloseEnough)
+    Start-Sleep -Seconds 3
+    $item = $null; $problems = @(); while ([WakeListenerSpeech.Continuous]::Heard.TryDequeue([ref]$item)) { if ($item -like "completed|Error*") { $problems += $item } }
+    [WakeListenerSpeech.Continuous]::Stop()
+    if ($problems) { "listening on silence: FAILED " + ($problems -join "; "); $ok = $false } else { "listening on silence: ran 3 seconds, no errors" }
+  } catch { $why = $_.Exception; while ($why.InnerException) { $why = $why.InnerException }; "listening on silence: FAILED " + $why.Message; $ok = $false }
   try { Start-Session "classic"; Start-Sleep -Seconds 2; Stop-Session "classic"; "listening: started and stopped" }
   catch { $why = $_.Exception; while ($why.InnerException) { $why = $why.InnerException }; "listening: " + $why.Message + $(if (-not $mic) { " (expected: no microphone here)" } else { "" }); if ($mic) { $ok = $false } }
   if ($ok) { exit 0 } else { exit 1 }
@@ -528,10 +552,12 @@ while (-not $script:quit) {
           $host.UI.RawUI.WindowTitle = "Wake listener: listening on " + $mic.Name
           $since = Get-Date; $script:loudest = 0; $script:windowLoudest = 0; $quietWarned = $false
           $script:lastEventAt = Get-Date; $script:soundSinceEvent = 0
+          $script:lastStartError = $null
         } catch {
           $why = $_.Exception; while ($why.InnerException) { $why = $why.InnerException }
           if ($why.HResult -eq -2147199735) { Say "Windows' speech privacy setting is blocking it: turn on Settings > Privacy & security > Speech > Online speech recognition. Trying again shortly." Yellow }
-          else { Say ("Couldn't start listening: " + $why.Message + " Trying again shortly.") Red }
+          elseif ($why.Message -ne $script:lastStartError) { Say ("Couldn't start listening: " + $why.Message + " Trying again every few seconds.") Red }
+          $script:lastStartError = $why.Message
           Stop-Session $recognizer; $recognizer = $null
           $restartAt = (Get-Date).AddSeconds(5)
         }
