@@ -14,7 +14,7 @@ param([switch]$Test)
 $Phrases       = @("hey assistant", "okay assistant")   # what to say, lowercase
 $Url           = "https://project-checkin.dev.limestonetg.com/assistant?start=voice"
 $Browser       = "edge-app"   # edge-app, chrome-app, or default
-$MinConfidence = 0.7          # raise it if it opens by mistake; lower it if it misses you
+$MinConfidence = 0.5          # raise it if it opens by mistake; lower it if it misses you
 $CooldownSecs  = 45           # ignore the phrase this long after opening
 # -----------------------------------------------------------------------------
 
@@ -73,6 +73,21 @@ try {
   Read-Host "Press Enter to close"
   exit 1
 }
+
+# A click in the window would start text selection, which pauses the script until
+# Esc. Turn that off for this window only, so a stray click can't stop it listening.
+try {
+  Add-Type -Namespace WakeListener -Name Console -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int which);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr handle, out uint mode);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr handle, uint mode);
+'@
+  $in = [WakeListener.Console]::GetStdHandle(-10)
+  $mode = 0
+  if ([WakeListener.Console]::GetConsoleMode($in, [ref]$mode)) {
+    [void][WakeListener.Console]::SetConsoleMode($in, ($mode -band (-bnot 0x40)) -bor 0x80)   # QuickEdit off (extended flags on)
+  }
+} catch { }
 
 $host.UI.RawUI.WindowTitle = "Wake listener: say `"$($Phrases[0])`""
 Write-Host "Wake listener is on. Say `"$($Phrases[0])`" and your assistant opens." -ForegroundColor Green
