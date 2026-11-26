@@ -104,3 +104,5 @@ Setup:
 
 `-DryRun` shows what it would send; `-Once` sends the thread list once; `-Uninstall` removes the scheduled task. Its log is `%LOCALAPPDATA%\ClaudeRelayelay.log`, and each job's prompt and output are kept for a week in `%LOCALAPPDATA%\ClaudeRelay\jobs`. Revoke the key on Project Check-in's Datalink page.
 
+Tested on 2026-11-26: Tyrone sent a Claude Code job through the relay to this PC.
+
