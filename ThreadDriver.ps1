@@ -23,7 +23,7 @@
 param([switch]$Doctor, [switch]$List, [string]$Type, [string]$Message, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "1.1.0"
+$Version = "1.2.0"
 $Folder = Join-Path $env:LOCALAPPDATA "ThreadDriver"
 $RelayKey = Join-Path $env:LOCALAPPDATA "ClaudeRelay\key.txt"
 $LogFile = Join-Path $Folder "driver.log"
@@ -90,21 +90,33 @@ function Send-Directory([string]$key) {
 }
 
 function Is-Busy($s) { return $s.latestUserFrameAt -and $s.lastTurnEdgeAt -and ([double]$s.latestUserFrameAt -gt [double]$s.lastTurnEdgeAt) }
-# Its last answer: the newest assistant text in its conversation file, after a given time.
-function Last-Answer($s, [DateTime]$after) {
+# Its answer to our message: the newest assistant text after the message we typed (found by its words), or,
+# when it can't be found, after the time we typed it (less a minute: a quick answer can beat the clock).
+function Last-Answer($s, [DateTime]$after, [string]$sent = "") {
   $cli = if ($s.cliSessionId) { [string]$s.cliSessionId } else { [string]$s.lastAssistantCliSessionId }
   $dir = Join-Path (Join-Path $env:USERPROFILE ".claude\projects") (([string]$s.cwd) -replace '[^A-Za-z0-9]', '-')
   $file = Join-Path $dir "$cli.jsonl"
   if (-not (Test-Path -LiteralPath $file)) { return $null }
   $lines = @(Get-Content -LiteralPath $file -Tail 400 -Encoding UTF8)
+  $mark = (($sent -replace '\s+', ' ').Trim()); $mark = $mark.Substring(0, [Math]::Min(40, $mark.Length))
+  $latest = $null
   for ($i = $lines.Count - 1; $i -ge 0; $i--) {
     $o = try { $lines[$i] | ConvertFrom-Json } catch { $null }
-    if (-not $o -or $o.type -ne "assistant") { continue }
-    if ($o.timestamp -and [DateTime]::Parse([string]$o.timestamp).ToUniversalTime() -lt $after.ToUniversalTime()) { return $null }
+    if (-not $o) { continue }
+    if ($o.type -eq "user" -and $mark) {
+      $said = if ($o.message.content -is [string]) { [string]$o.message.content } else { (@($o.message.content | Where-Object { $_.type -eq "text" } | ForEach-Object { [string]$_.text }) -join " ") }
+      if ((($said -replace '\s+', ' ')).Contains($mark)) { return $latest }
+    }
+    if ($o.type -ne "assistant") { continue }
     $text = (@($o.message.content | Where-Object { $_.type -eq "text" } | ForEach-Object { [string]$_.text }) -join "`n").Trim()
-    if ($text) { return $text }
+    if ($text -and -not $latest) {
+      if (-not $mark -and $o.timestamp -and [DateTime]::Parse([string]$o.timestamp).ToUniversalTime() -lt $after.ToUniversalTime().AddMinutes(-1)) { return $null }
+      $latest = $text
+    }
   }
-  return $null
+  # Our message wasn't found in the last 400 lines: go by the time instead.
+  if ($mark) { return (Last-Answer $s $after "") }
+  return $latest
 }
 
 Add-Type @"
@@ -132,8 +144,25 @@ function Box-Text($box) {
   return ""
 }
 
-# Types one message into a thread. Returns $null when it went in, or why it didn't (and whether to try again later).
+# Types one message into a thread, then puts back the window that was in front (Tyrone, say), so you're
+# returned to where you were. Returns $null when it went in, or why it didn't (and whether to try again later).
 function Type-Into([string]$threadId, [string]$text) {
+  $prev = [Win]::GetForegroundWindow()
+  try { return (Type-IntoThread $threadId $text) }
+  finally {
+    $claude = Claude-Window
+    if ($prev -ne [IntPtr]::Zero -and (-not $claude -or $prev -ne $claude.MainWindowHandle)) {
+      Start-Sleep -Milliseconds 300
+      foreach ($try in 1..5) {
+        [Win]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [Win]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [void][Win]::SetForegroundWindow($prev); Start-Sleep -Milliseconds 200
+        if ([Win]::GetForegroundWindow() -eq $prev) { break }
+      }
+    }
+  }
+}
+
+function Type-IntoThread([string]$threadId, [string]$text) {
   if (Is-Locked) { return @{ wait = $true; why = "The PC is locked, or Remote Desktop to it is disconnected, so there's no screen to type on yet" } }
   $s = Get-Session $threadId
   if (-not $s) { return @{ wait = $false; why = "That thread isn't on this PC" } }
@@ -227,7 +256,7 @@ function Check([string]$key) {
         if (((Get-Date).ToUniversalTime() - $since.ToUniversalTime()).TotalHours -gt 3) { Report $key $id "failed" "The thread was still going three hours later; its answer is in the thread" ""; $typed.Remove($id); Save-Typed $typed }
         continue
       }
-      $answer = Last-Answer $s $since
+      $answer = Last-Answer $s $since ([string]$m.text)
       if ($answer) { Report $key $id "replied" "" $answer; Log "$id answered."; $typed.Remove($id); $typed.Remove("note:$id"); Save-Typed $typed }
     }
   }
@@ -254,7 +283,7 @@ if ($Type) {
   if ($r) { Write-Host "Not typed: $($r.why)" -ForegroundColor Yellow; exit 1 }
   Write-Host "Typed. Waiting for the thread's answer..." -ForegroundColor Green
   $since = (Get-Date).AddSeconds(-30)
-  foreach ($i in 1..240) { Start-Sleep -Seconds 5; $s = Get-Session $Type; if ($s -and -not (Is-Busy $s)) { $a = Last-Answer $s $since; if ($a) { Write-Host "Answer:`n$a"; exit 0 } } }
+  foreach ($i in 1..240) { Start-Sleep -Seconds 5; $s = Get-Session $Type; if ($s -and -not (Is-Busy $s)) { $a = Last-Answer $s $since $Message; if ($a) { Write-Host "Answer:`n$a"; exit 0 } } }
   Write-Host "No answer after 20 minutes." -ForegroundColor Yellow; exit 1
 }
 
