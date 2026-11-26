@@ -6,7 +6,7 @@ Since 6.0 the listening is done by a **neural keyword engine** ([sherpa-onnx](ht
 
 ## Install
 
-1. Download **[WakeListener.zip](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest/download/WakeListener.zip)**, right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
+1. Download the latest version from **[Releases](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest)**: the file named with its version, such as `WakeListener-6.3.1.zip` (`WakeListener.zip` there is the same file). Right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
 2. Double-click **Start wake listener.cmd**. (If Windows asks about running it, choose **Run**.)
 3. **First run: it sets up the engine** (a few minutes, once, needs the internet). The activity window shows each step:
    - Python: it uses yours (3.11 to 3.14), or installs Python 3.12 from python.org for your Windows account only, through winget;
@@ -38,6 +38,8 @@ It also runs as a **tray icon** by the clock. Hover it to see the microphone and
 While the assistant is open it lets go of the microphone, and takes it back when the assistant closes.
 
 **Start with Windows:** press Win+R, type `shell:startup`, press Enter, and put a shortcut to **Start wake listener.cmd** in that folder.
+
+**Which version you have:** it's at the top of the right-click menu, and in the tray icon's hover text.
 
 **Stop:** right-click the tray icon > Quit.
 

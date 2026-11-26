@@ -16,7 +16,7 @@
 
 param([switch]$Test)
 
-$Version = "6.3.0"
+$Version = "6.3.1"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Tyrone"   # what you'll say (two or three words work best)
@@ -426,7 +426,7 @@ $script:tray.add_DoubleClick({ Set-WindowShown $true })
 $script:lastHeard = ""
 function Set-TrayText {
   $micName = if ($script:micName) { $script:micName } else { "no microphone" }
-  $text = $(if ($script:paused) { "Wake listener: paused" } else { "Wake listener: listening" }) + "`n" + $micName + $(if ($script:lastHeard) { "`nLast: " + $script:lastHeard } else { "" })
+  $text = $(if ($script:paused) { "Wake listener $Version`: paused" } else { "Wake listener $Version`: listening" }) + "`n" + $micName + $(if ($script:lastHeard) { "`nLast: " + $script:lastHeard } else { "" })
   $script:tray.Text = if ($text.Length -gt 63) { $text.Substring(0, 63) } else { $text }
 }
 $script:lastBalloon = [datetime]::MinValue
@@ -820,6 +820,12 @@ function Step-Update([bool]$asked) {
 $updateItem = New-Object System.Windows.Forms.MenuItem("Check for updates")
 $updateItem.add_Click({ $script:updateNow = $true })
 $script:tray.ContextMenu.MenuItems.Add($script:tray.ContextMenu.MenuItems.Count - 2, $updateItem) | Out-Null
+
+# The version, at the top of the menu (the tray icon's and Floating Tyrone's).
+$versionItem = New-Object System.Windows.Forms.MenuItem("Wake listener $Version")
+$versionItem.Enabled = $false
+$script:tray.ContextMenu.MenuItems.Add(0, $versionItem) | Out-Null
+$script:tray.ContextMenu.MenuItems.Add(1, (New-Object System.Windows.Forms.MenuItem("-"))) | Out-Null
 
 # ---- Start ------------------------------------------------------------------
 Clear-Host
