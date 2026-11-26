@@ -82,3 +82,15 @@ Earlier versions:
 ## Why not an exe
 
 1.0.0 and 1.1.0 were a small unsigned tray exe. Windows Defender flagged a downloaded copy (`Behavior:Win32/Persistence.A!ml`, then `Trojan:Win32/Wacatac.H!ml`), as it often does with new unsigned programs that use the microphone. The script does the same job inside Windows' own signed PowerShell, with the engine in Python. The exe source (`WakeListener.cs`, `build.ps1`) is kept for when it can be code-signed.
+
+## Claude relay (ClaudeRelay.ps1)
+
+Tells Tyrone what's going on in your Claude Code threads. Run it on the PC where the Claude desktop app runs your threads, which may not be the PC with the wake listener (for example a desktop you reach over Remote Desktop).
+
+Every two minutes it reads the desktop app's session files on that PC and sends Project Check-in the list: each thread's name, folder, whether it's working, waiting on you or done, its last report and what it needs from you. Read only: it sends nothing to the threads.
+
+1. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Connect`, then press **Connect Claude relay** on the page that opens. The key is kept encrypted for your Windows account in `%LOCALAPPDATA%\ClaudeRelay`.
+2. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Install` copies it to `%LOCALAPPDATA%\ClaudeRelay` and starts it hidden at every sign-in (a scheduled task named Claude relay).
+
+`-DryRun` shows what it would send; `-Once` sends once; `-Uninstall` removes the scheduled task. Its log is `%LOCALAPPDATA%\ClaudeRelayelay.log`. Revoke the key on Project Check-in's Datalink page.
+
