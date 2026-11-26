@@ -7,14 +7,18 @@
 #    (each thread's name, folder, whether it's working or done, its last report,
 #    anything it needs from you) and sends that list to Project Check-in with its
 #    own key, so "what's going on in my threads?" gets an answer.
-# 2. Every 20 seconds it checks for Claude Code jobs Tyrone was asked to send
-#    ("tell the project-checkin thread to fix the Ask button"). Each runs in the
-#    background with this PC's Claude Code, in one of your project folders only
-#    (a folder where a Claude Code thread has run in the last 30 days), with
-#    file edits allowed and any command your project hasn't allowed refused. A
-#    job for a thread picks up from that thread's conversation in a copy, so the
-#    thread itself is untouched. The result goes back to Tyrone and your chat.
-#    Claude Code here needs signing in once: see -Doctor.
+# 2. Every Claude Code job Tyrone sends goes to one Tyrone thread: a Claude
+#    Code session on this PC, in the folder that holds your projects, picked up
+#    again for each job (one at a time), so it remembers what came before. It
+#    does a small job itself, or hands parts to subthreads that run at the same
+#    time (up to 5): each in its own git worktree of one project, on its own
+#    branch (tyrone/...), committed by the relay when it finishes and then
+#    closed. Nothing is merged into a main branch. File edits are allowed; any
+#    command your project hasn't allowed is refused. Results go back to Tyrone
+#    and your chat. Claude Code here needs signing in once: see -Doctor.
+# 3. While anything runs, every few seconds it sends what the Tyrone thread and
+#    each subthread are doing, step by step (reading a file, editing one,
+#    running the tests), so Talk shows it live.
 #
 #   ClaudeRelay.ps1 -Connect     one click on Project Check-in gives it a key
 #   ClaudeRelay.ps1 -Doctor      checks Claude Code is here and signed in, and lists the folders jobs can use
@@ -29,7 +33,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "2.0.0"
+$Version = "3.0.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -37,8 +41,13 @@ $LogFile = Join-Path $Folder "relay.log"
 $TaskName = "Claude relay"
 $ThreadsUrl = $Base.TrimEnd("/") + "/api/teams/messages/intake/claude-threads"
 $TasksUrl = $Base.TrimEnd("/") + "/api/teams/messages/intake/tasks"
+$LiveUrl = $Base.TrimEnd("/") + "/api/teams/messages/intake/claude-live"
 $JobsDir = Join-Path $Folder "jobs"
-$MaxRunning = 2
+$SubDir = Join-Path $Folder "subthreads"
+$SpawnDir = Join-Path $Folder "spawn"
+$WtDir = Join-Path $Folder "wt"
+$TyroneFile = Join-Path $Folder "tyrone.json"
+$MaxSubthreads = 5
 $JobMinutes = 45
 $null = New-Item -ItemType Directory -Force $Folder
 
@@ -133,7 +142,7 @@ function Send-Threads([string]$key) {
   return "Sent $(@($threads).Count) threads ($working working, $needs waiting on you)."
 }
 
-# ---- Claude Code jobs from Tyrone ----
+# ---- Claude Code jobs from Tyrone: one Tyrone thread, and its subthreads ----
 function Web([string]$key) {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   $web = New-Object System.Net.WebClient
@@ -171,111 +180,319 @@ function Claude-Problem {
   return $problem
 }
 
-function Job-Prompt($t, [string]$project) {
-  $from = if ($t.from) { [string]$t.from } else { "you" }
-  return @"
-This job was sent by Tyrone, $from's assistant, from a phone call or chat, and is running in the background with no one watching. Do it in the $(Split-Path $project -Leaf) project ($project):
+function Read-Json([string]$path) { if (-not (Test-Path -LiteralPath $path)) { return $null }; try { return ([IO.File]::ReadAllText($path) | ConvertFrom-Json) } catch { return $null } }
+function Write-Json([string]$path, $value) { [IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $value -Depth 6), (New-Object Text.UTF8Encoding($false))) }
+function Clip([string]$s, [int]$max) { $s = ($s -replace '\s+', ' ').Trim(); if ($s.Length -gt $max) { return $s.Substring(0, $max).TrimEnd() + "…" }; return $s }
 
+# The Tyrone thread lives in the folder that holds your projects (C:\...\Projects): the most common parent of the job folders.
+function Get-Home {
+  $paths = @((Get-JobFolders).Values | ForEach-Object { $_.path })
+  if (-not $paths.Count) { return $null }
+  $best = $paths | ForEach-Object { Split-Path $_ -Parent } | Group-Object | Sort-Object Count -Descending | Select-Object -First 1
+  $h = [string]$best.Name
+  if (-not $h.StartsWith($env:USERPROFILE + "\", [StringComparison]::OrdinalIgnoreCase)) { return $null }
+  if (@($env:LOCALAPPDATA, $env:APPDATA, $env:TEMP) | Where-Object { $_ -and $h.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }) { return $null }
+  return $h
+}
+
+# The Tyrone thread's state: its Claude Code session, and notes for its next job (subthreads that finished since).
+function Get-Tyrone { $t = Read-Json $TyroneFile; if (-not $t) { $t = [pscustomobject]@{ sessionId = ""; notes = @() } }; if (-not $t.notes) { $t | Add-Member -Force notes @() }; return $t }
+function Add-Note([string]$text) { $t = Get-Tyrone; $t.notes = @(@($t.notes) + $text | Select-Object -Last 20); Write-Json $TyroneFile $t }
+
+# ---- What a run is doing, step by step, from Claude Code's stream ----
+$script:Streams = @{}
+function Step-Texts($ev) {
+  $out = @()
+  if ($ev.type -ne "assistant" -or -not $ev.message.content) { return $out }
+  foreach ($c in @($ev.message.content)) {
+    if ($c.type -eq "text" -and ([string]$c.text).Trim()) { $out += Clip ([string]$c.text) 160; continue }
+    if ($c.type -ne "tool_use") { continue }
+    $i = $c.input
+    $leaf = if ($i.file_path) { Split-Path ([string]$i.file_path) -Leaf } elseif ($i.notebook_path) { Split-Path ([string]$i.notebook_path) -Leaf } else { "" }
+    switch -Regex ([string]$c.name) {
+      '^Read$' { $out += "Reading $leaf" }
+      '^(Edit|MultiEdit|NotebookEdit)$' { $out += "Editing $leaf" }
+      '^Write$' { $out += "Writing $leaf" }
+      '^Bash$|^PowerShell$' { $out += "Running: " + (Clip ([string]$i.command) 80) }
+      '^(Grep|Glob)$' { $out += "Searching the code" }
+      '^(Task|Agent)$' { $out += "Starting a helper: " + (Clip ([string]$i.description) 80) }
+      '^(WebFetch|WebSearch)$' { $out += "Looking it up online" }
+      '^(TodoWrite|TaskCreate|TaskUpdate)$' { }
+      default { $out += "Using " + [string]$c.name }
+    }
+  }
+  return $out
+}
+
+# Reads what's new in a run's output (out.json, one event a line) and keeps its last steps and session.
+function Read-Stream([string]$dir) {
+  $s = $script:Streams[$dir]
+  if (-not $s) { $s = @{ pos = 0; rest = ""; steps = New-Object System.Collections.ArrayList; session = "" }; $script:Streams[$dir] = $s }
+  $file = Join-Path $dir "out.json"
+  if (-not (Test-Path -LiteralPath $file)) { return $s }
+  try {
+    $fs = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try { [void]$fs.Seek($s.pos, [IO.SeekOrigin]::Begin); $buf = New-Object byte[] ($fs.Length - $s.pos); $n = $fs.Read($buf, 0, $buf.Length); $s.pos += $n }
+    finally { $fs.Close() }
+    $text = $s.rest + [Text.Encoding]::UTF8.GetString($buf, 0, $n)
+    $lines = @($text -split "`n")
+    $s.rest = $lines[-1]
+    $whole = if ($lines.Count -gt 1) { $lines[0..($lines.Count - 2)] } else { @() }
+    foreach ($line in $whole) {
+      if (-not $line.Trim()) { continue }
+      $ev = try { $line | ConvertFrom-Json } catch { $null }
+      if (-not $ev) { continue }
+      if ($ev.session_id -and -not $s.session) { $s.session = [string]$ev.session_id }
+      foreach ($step in (Step-Texts $ev)) { [void]$s.steps.Add(@{ at = (Get-Date).ToUniversalTime().ToString("o"); text = $step }); while ($s.steps.Count -gt 15) { $s.steps.RemoveAt(0) } }
+    }
+  } catch { }
+  return $s
+}
+
+# What a finished run said: its summary, plus anything it was refused.
+function Run-Result([string]$dir) {
+  $lines = try { [IO.File]::ReadAllLines((Join-Path $dir "out.json")) } catch { @() }
+  $out = $null
+  foreach ($l in $lines) { if ($l -match '"type"\s*:\s*"result"') { $out = try { $l | ConvertFrom-Json } catch { $null } } }
+  if (-not $out) {
+    $err = try { (Get-Content (Join-Path $dir "err.txt") -Raw -Encoding UTF8).Trim() } catch { "" }
+    return @{ ok = $false; text = "Claude Code stopped without a result. $(if ($err) { $err.Substring(0, [Math]::Min(500, $err.Length)) })"; session = "" }
+  }
+  $text = [string]$out.result
+  $denied = @($out.permission_denials).Count
+  if ($denied) { $text += "`n`n($denied step$(if ($denied -ne 1) { 's' }) needed permission that a background job doesn't have, such as running a command your project hasn't allowed, so $(if ($denied -ne 1) { 'they were' } else { 'it was' }) skipped.)" }
+  return @{ ok = -not $out.is_error; text = $text; session = [string]$out.session_id }
+}
+
+function Start-Claude([string]$dir, [string]$where, [string[]]$extra, [string]$prompt) {
+  [IO.File]::WriteAllText((Join-Path $dir "prompt.txt"), $prompt, (New-Object Text.UTF8Encoding($false)))
+  $cliArgs = @("-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits") + $extra
+  return Start-Process -FilePath (Find-Claude) -ArgumentList $cliArgs -WorkingDirectory $where -RedirectStandardInput (Join-Path $dir "prompt.txt") -RedirectStandardOutput (Join-Path $dir "out.json") -RedirectStandardError (Join-Path $dir "err.txt") -NoNewWindow -PassThru
+}
+
+function Is-Running($job) { $p = Get-Process -Id ([int]$job.pid) -ErrorAction SilentlyContinue; return $p -and -not $p.HasExited -and $p.ProcessName -match "claude" }
+
+# ---- The Tyrone thread: every job Tyrone sends goes to it, one at a time ----
+function Tyrone-Prompt($t, [string]$homeDir, $notes) {
+  $from = if ($t.from) { [string]$t.from } else { "you" }
+  $projects = ((Get-JobFolders).Values | Sort-Object { $_.name } | ForEach-Object { "- " + $_.name + " (" + $_.path + ")" }) -join "`n"
+  $running = @(Get-Subthreads | Where-Object { $_.state -eq "working" -or $_.state -eq "queued" } | ForEach-Object { "- " + $_.id + ": `"" + $_.title + "`" in " + $_.folder + " (" + $_.state + ")" }) -join "`n"
+  $hint = if ($t.claude.folder) { "`nTyrone named the project: $($t.claude.folder)." } else { "" }
+  $since = if (@($notes).Count) { "`nSince your last job:`n" + ((@($notes) | ForEach-Object { "- " + $_ }) -join "`n") + "`n" } else { "" }
+  return @"
+You are the Tyrone thread: $from's one Claude Code thread for jobs sent by Tyrone, $from's assistant, from a phone call or chat. You run in the background with no one watching, in $homeDir, which holds $from's projects:
+$projects
+$since
+New job from ${from}:$hint
 $($t.task)
 
-Work only in that project folder. If something you need isn't allowed or isn't clear, don't guess: stop and say what's needed. Finish with a short plain summary (a few sentences) of what you did, what changed, and anything left for $from to do; it's read to them by Tyrone.
+How to work:
+- A small job in one project: do it yourself, working only in that project's folder.
+- A job with separate parts, or a long one: hand parts to subthreads, which run at the same time, up to 5 at once (more wait their turn). To start one, write a file into $SpawnDir named <short-name>.json, with {"title": "a few words", "folder": "<one project name from the list>", "task": "complete instructions: the subthread knows nothing else"}. Each subthread works on its own git branch in its own copy of that project; the relay commits its changes to that branch and closes it when it's done, and nothing is merged into the main branch unless $from asks. Never start two subthreads on the same project for parts that touch the same files.
+- To stop a subthread that isn't needed any more, write $SpawnDir\stop-<its id>.json (any content).
+Running or waiting subthreads now:
+$(if ($running) { $running } else { "- none" })
+
+If something you need isn't allowed or isn't clear, don't guess: say what's needed. Finish with a short plain summary (a few sentences) of what you did, which subthreads you started and why, and anything left for $from to do; Tyrone reads it to them.
 "@
 }
 
-function Start-Job($key, $t) {
+function Start-TyroneJob($key, $t) {
   $id = [string]$t.id
   $dir = Join-Path $JobsDir $id
   if (Test-Path $dir) { return }
   $null = New-Item -ItemType Directory -Force $dir
   $problem = Claude-Problem
+  $homeDir = Get-Home
+  if (-not $problem -and -not $homeDir) { $problem = "No project folders were found on this PC (where a Claude Code thread ran in the last 30 days), so the Tyrone thread has nowhere to work." }
   if ($problem) { Report $key $id "failed" $problem | Out-Null; Set-Content (Join-Path $dir "done.txt") "failed: not ready"; Log "Job $id not run: $problem"; return }
-  $exe = Find-Claude
-  $cliArgs = @("-p", "--output-format", "json", "--permission-mode", "acceptEdits")
-  $where = $null; $fresh = ""
-  $allowed = @((Get-JobFolders).Values | ForEach-Object { $_.path })
-  if ($t.claude.thread_id) {
-    $s = Get-Session ([string]$t.claude.thread_id)
-    $cli = if ($s) { if ($s.cliSessionId) { [string]$s.cliSessionId } else { [string]$s.lastAssistantCliSessionId } } else { "" }
-    # Only a thread that ran in one of the project folders (or a worktree of one) is picked up from; its conversation is kept by folder, so it runs there.
-    $cwd = if ($s -and $s.cwd) { ([string]$s.cwd).TrimEnd("\") } else { "" }
-    $inProject = $cwd -and @($allowed | Where-Object { $cwd -ieq $_ -or $cwd.StartsWith($_ + "\.claude\worktrees\", [StringComparison]::OrdinalIgnoreCase) }).Count
-    # Or a folder in their profile that holds their projects (threads often start in C:\...\Projects and work in one): the job is told to stay in its project.
-    $underProfile = $cwd -and $cwd.StartsWith($env:USERPROFILE + "\", [StringComparison]::OrdinalIgnoreCase) -and -not (@($env:LOCALAPPDATA, $env:APPDATA, $env:TEMP) | Where-Object { $_ -and $cwd.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) })
-    if (-not $inProject -and $underProfile) { $inProject = @($allowed | Where-Object { $_.StartsWith($cwd + "\", [StringComparison]::OrdinalIgnoreCase) }).Count }
-    if (-not ($s -and $cli -and $inProject)) { $fresh = " (starting fresh: that thread can't be picked up from here)" }
-    if ($s -and $cli -and $inProject -and (Test-Path -LiteralPath $cwd -PathType Container)) {
-      $where = $cwd
-      # A copy of the thread's conversation (--fork-session): the thread itself is never changed.
-      $cliArgs += @("--resume", $cli, "--fork-session")
-    }
-  }
-  if (-not $where) {
-    $match = (Get-JobFolders)[([string]$t.claude.folder).ToLower()]
-    if ($match) { $where = $match.path }
-  }
-  if (-not $where) { Report $key $id "failed" "The folder $($t.claude.folder) isn't one of your project folders on this PC (where a Claude Code thread has run in the last 30 days), so nothing was run." | Out-Null; Set-Content (Join-Path $dir "done.txt") "failed: no folder"; return }
-  $project = $where
-  $named = (Get-JobFolders)[([string]$t.claude.folder).ToLower()]
-  if ($named -and ($where -ieq $named.path -or $named.path.StartsWith($where + "\", [StringComparison]::OrdinalIgnoreCase))) { $project = $named.path }
-  [IO.File]::WriteAllText((Join-Path $dir "prompt.txt"), (Job-Prompt $t $project), (New-Object Text.UTF8Encoding($false)))
-  $p = Start-Process -FilePath $exe -ArgumentList $cliArgs -WorkingDirectory $where -RedirectStandardInput (Join-Path $dir "prompt.txt") -RedirectStandardOutput (Join-Path $dir "out.json") -RedirectStandardError (Join-Path $dir "err.txt") -NoNewWindow -PassThru
-  ConvertTo-Json @{ pid = $p.Id; started = (Get-Date).ToString("o"); where = $where; task = [string]$t.task } | Set-Content (Join-Path $dir "job.json") -Encoding UTF8
-  Log "Job $id started in $where$(if ($t.claude.thread_id) { ' (from thread ' + $t.claude.thread_title + ')' })."
-  Report $key $id "working" "Claude Code started on the PC, in $(Split-Path $project -Leaf)$fresh." | Out-Null
-}
-
-# What a finished job said: its summary, plus anything it was refused.
-function Job-Result([string]$dir) {
-  $raw = try { Get-Content (Join-Path $dir "out.json") -Raw -Encoding UTF8 } catch { "" }
-  $out = try { $raw | ConvertFrom-Json } catch { $null }
-  if (-not $out) {
-    $err = try { (Get-Content (Join-Path $dir "err.txt") -Raw -Encoding UTF8).Trim() } catch { "" }
-    return @{ ok = $false; text = "Claude Code stopped without a result. $(if ($err) { $err.Substring(0, [Math]::Min(500, $err.Length)) })" }
-  }
-  $text = [string]$out.result
-  $denied = @($out.permission_denials).Count
-  if ($denied) { $text += "`n`n($denied step$(if ($denied -ne 1) { 's' }) needed permission that a background job doesn't have, such as running a command your project hasn't allowed, so $(if ($denied -ne 1) { 'they were' } else { 'it was' }) skipped. Open the thread to do $(if ($denied -ne 1) { 'those' } else { 'that' }) yourself.)" }
-  return @{ ok = -not $out.is_error; text = $text }
+  $null = New-Item -ItemType Directory -Force $SpawnDir
+  $state = Get-Tyrone
+  $notes = @($state.notes)
+  $extra = @("--add-dir", $SpawnDir)
+  if ($state.sessionId) { $extra += @("--resume", [string]$state.sessionId) }
+  $p = Start-Claude $dir $homeDir $extra (Tyrone-Prompt $t $homeDir $notes)
+  $state.notes = @(); Write-Json $TyroneFile $state
+  Write-Json (Join-Path $dir "job.json") @{ pid = $p.Id; started = (Get-Date).ToString("o"); where = $homeDir; task = [string]$t.task; notes = $notes; resumed = [string]$state.sessionId }
+  Log "Job $id started in the Tyrone thread$(if ($state.sessionId) { '' } else { ' (a new one)' })."
+  Report $key $id "working" "The Tyrone thread on your PC picked it up." | Out-Null
 }
 
 function Check-Jobs($key, $openIds) {
   foreach ($d in @(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue)) {
     if (Test-Path (Join-Path $d.FullName "done.txt")) { continue }
-    $jf = Join-Path $d.FullName "job.json"
-    if (-not (Test-Path $jf)) { continue }
-    $job = Get-Content $jf -Raw | ConvertFrom-Json
-    $proc = Get-Process -Id ([int]$job.pid) -ErrorAction SilentlyContinue
-    $running = $proc -and -not $proc.HasExited -and $proc.ProcessName -match "claude"
+    $job = Read-Json (Join-Path $d.FullName "job.json")
+    if (-not $job) { continue }
+    $running = Is-Running $job
     $age = ((Get-Date) - [DateTime]::Parse([string]$job.started)).TotalMinutes
+    if ($running) { $null = Read-Stream $d.FullName }
     if ($running -and $openIds -ne $null -and -not ($openIds -contains $d.Name)) {
-      # Cancelled on Project Check-in.
-      Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue; Set-Content (Join-Path $d.FullName "done.txt") "cancelled"; Log "Job $($d.Name) cancelled."; continue
+      Stop-Process -Id ([int]$job.pid) -Force -ErrorAction SilentlyContinue; Set-Content (Join-Path $d.FullName "done.txt") "cancelled"; Log "Job $($d.Name) cancelled."; continue
     }
     if ($running -and $age -lt $JobMinutes) { continue }
     if ($running) {
-      Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-      $r = @{ ok = $false; text = "Claude Code was still going after $JobMinutes minutes, so the job was stopped. Open the project on the PC to see how far it got." }
-    } else { $r = Job-Result $d.FullName }
+      Stop-Process -Id ([int]$job.pid) -Force -ErrorAction SilentlyContinue
+      $r = @{ ok = $false; text = "The Tyrone thread was still going after $JobMinutes minutes, so the job was stopped."; session = "" }
+    } else { $r = Run-Result $d.FullName }
+    # The thread's session carries on to the next job. A resume that failed starts a new thread next time, with the notes it missed.
+    $state = Get-Tyrone
+    if ($r.session) { $state.sessionId = $r.session }
+    elseif ($job.resumed -and -not $r.ok) { $state.sessionId = ""; $state.notes = @(@($job.notes) + @($state.notes)) }
+    Write-Json $TyroneFile $state
     try {
-      $null = Report $key $d.Name $(if ($r.ok) { "done" } else { "failed" }) $(if ($r.text.Trim()) { $r.text.Trim() } else { "Done (Claude Code gave no summary)." })
+      $null = Report $key $d.Name $(if ($r.ok) { "done" } else { "failed" }) $(if ($r.text.Trim()) { $r.text.Trim() } else { "Done (the Tyrone thread gave no summary)." })
       Set-Content (Join-Path $d.FullName "done.txt") $(if ($r.ok) { "done" } else { "failed" })
       Log "Job $($d.Name) $(if ($r.ok) { 'done' } else { 'failed' })."
     } catch { Log ("Job $($d.Name) result not sent yet: " + (Why $_)) }
   }
 }
 
+# ---- Subthreads: started by the Tyrone thread, up to $MaxSubthreads at once ----
+function Get-Subthreads { return @(Get-ChildItem $SubDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { Read-Json (Join-Path $_.FullName "sub.json") } | Where-Object { $_ }) }
+function Save-Sub($s) { Write-Json (Join-Path (Join-Path $SubDir $s.id) "sub.json") $s }
+function Slug([string]$s) { $x = ($s.ToLower() -replace '[^a-z0-9]+', '-').Trim('-'); if ($x.Length -gt 30) { $x = $x.Substring(0, 30).Trim('-') }; if (-not $x) { $x = "task" }; return $x }
+
+# Spawn files the Tyrone thread wrote: each becomes a waiting subthread; stop-<id>.json stops one.
+function Take-Spawns {
+  if (-not (Test-Path $SpawnDir)) { return }
+  $folders = Get-JobFolders
+  foreach ($f in @(Get-ChildItem $SpawnDir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+    if ($f.BaseName -like "stop-*") {
+      $sid = $f.BaseName.Substring(5)
+      $s = Read-Json (Join-Path (Join-Path $SubDir $sid) "sub.json")
+      if ($s -and ($s.state -eq "working" -or $s.state -eq "queued")) {
+        if ($s.pid) { Stop-Process -Id ([int]$s.pid) -Force -ErrorAction SilentlyContinue }
+        $s.state = "stopped"; $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o")); $s | Add-Member -Force result "Stopped by the Tyrone thread."; Save-Sub $s; Close-Worktree $s
+        Log "Subthread $sid stopped."
+      }
+      Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue; continue
+    }
+    $spec = Read-Json $f.FullName
+    Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+    $title = Clip ([string]$spec.title) 80; $task = [string]$spec.task; $folder = [string]$spec.folder
+    $match = if ($folder) { $folders[$folder.ToLower()] } else { $null }
+    if (-not $spec -or -not $title -or $task.Trim().Length -lt 10 -or -not $match) {
+      Add-Note "The subthread file $($f.Name) wasn't started: it needs a title, a task, and a folder from the project list ($folder isn't one)."
+      Log "Spawn file $($f.Name) skipped."; continue
+    }
+    $id = "st-" + ([guid]::NewGuid().ToString("N").Substring(0, 6))
+    $null = New-Item -ItemType Directory -Force (Join-Path $SubDir $id)
+    Save-Sub ([pscustomobject]@{ id = $id; title = $title; folder = $match.name; path = $match.path; task = $task; state = "queued"; queuedAt = (Get-Date).ToUniversalTime().ToString("o") })
+    Log "Subthread $id queued: $title ($($match.name))."
+  }
+}
+
+function Close-Worktree($s) {
+  if (-not $s.worktree) { return }
+  $wt = [string]$s.worktree
+  if (Test-Path -LiteralPath $wt) {
+    if (@(& git -C $wt status --porcelain 2>$null).Count) {
+      & git -C $wt add -A 2>$null | Out-Null
+      & git -C $wt commit -q -m "Tyrone subthread: $($s.title)" 2>$null | Out-Null
+    }
+    & git -C ([string]$s.path) worktree remove --force $wt 2>$null | Out-Null
+  }
+  $ahead = [int](& git -C ([string]$s.path) rev-list --count "$($s.base)..$($s.branch)" 2>$null)
+  if ($ahead -gt 0) { $s | Add-Member -Force kept $true } else { & git -C ([string]$s.path) branch -D ([string]$s.branch) 2>$null | Out-Null; $s | Add-Member -Force kept $false }
+  Save-Sub $s
+}
+
+function Start-Sub($s) {
+  $dir = Join-Path $SubDir $s.id
+  $where = [string]$s.path
+  if (Test-Path -LiteralPath (Join-Path $where ".git")) {
+    $branch = "tyrone/" + (Slug $s.title) + "-" + $s.id.Substring(3)
+    $wt = Join-Path $WtDir $s.id
+    $base = (& git -C $where rev-parse HEAD 2>$null | Out-String).Trim()
+    & git -C $where worktree add -q $wt -b $branch 2>$null | Out-Null
+    if (-not (Test-Path -LiteralPath $wt)) { $s.state = "failed"; $s | Add-Member -Force result "Its own copy of $($s.folder) couldn't be made (git worktree), so it didn't start."; $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o")); Save-Sub $s; Add-Note "Subthread `"$($s.title)`" ($($s.folder)) failed: $($s.result)"; return }
+    $s | Add-Member -Force worktree $wt; $s | Add-Member -Force branch $branch; $s | Add-Member -Force base $base
+    $where = $wt
+  }
+  $prompt = @"
+You are a subthread of the Tyrone thread, running in the background with no one watching. Do this in the $($s.folder) project$(if ($s.branch) { " (your own copy of it, on the branch $($s.branch))" }):
+
+$($s.task)
+
+Work only in this folder. Don't commit or merge: the relay commits your changes to your branch when you finish. If something you need isn't allowed or isn't clear, don't guess: stop and say what's needed. Finish with a short plain summary (a few sentences) of what you did and what changed.
+"@
+  $p = Start-Claude $dir $where @() $prompt
+  $s.state = "working"; $s | Add-Member -Force pid $p.Id; $s | Add-Member -Force startedAt ((Get-Date).ToUniversalTime().ToString("o")); Save-Sub $s
+  Log "Subthread $($s.id) started in $where."
+}
+
+function Check-Subs {
+  Take-Spawns
+  $all = Get-Subthreads
+  foreach ($s in @($all | Where-Object { $_.state -eq "working" })) {
+    $dir = Join-Path $SubDir $s.id
+    $running = Is-Running $s
+    if ($running) { $null = Read-Stream $dir }
+    $age = ((Get-Date).ToUniversalTime() - [DateTime]::Parse([string]$s.startedAt).ToUniversalTime()).TotalMinutes
+    if ($running -and $age -lt $JobMinutes) { continue }
+    if ($running) { Stop-Process -Id ([int]$s.pid) -Force -ErrorAction SilentlyContinue; $r = @{ ok = $false; text = "Still going after $JobMinutes minutes, so it was stopped." } } else { $r = Run-Result $dir }
+    $s.state = $(if ($r.ok) { "done" } else { "failed" }); $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o"))
+    Close-Worktree $s
+    $where = if ($s.branch) { if ($s.kept) { " Its changes are on the branch $($s.branch) in $($s.folder), not merged." } else { " It changed no files." } } else { "" }
+    $s | Add-Member -Force result ((Clip $r.text 2500) + $where)
+    Save-Sub $s
+    Add-Note "Subthread $($s.id) `"$($s.title)`" ($($s.folder)) $($s.state): $(Clip $r.text 1200)$where"
+    Log "Subthread $($s.id) $($s.state)."
+  }
+  # Waiting ones start as places free up; a project with no git gets one subthread at a time.
+  $working = @(Get-Subthreads | Where-Object { $_.state -eq "working" })
+  foreach ($s in @(Get-Subthreads | Where-Object { $_.state -eq "queued" } | Sort-Object { [string]$_.queuedAt })) {
+    if ($working.Count -ge $MaxSubthreads) { break }
+    if (-not (Test-Path -LiteralPath (Join-Path ([string]$s.path) ".git")) -and @($working | Where-Object { $_.path -eq $s.path }).Count) { continue }
+    if (Claude-Problem) { break }
+    Start-Sub $s
+    $working += $s
+  }
+  # Finished subthreads go after a week.
+  foreach ($s in @(Get-Subthreads | Where-Object { $_.finishedAt -and ((Get-Date).ToUniversalTime() - [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime()).TotalDays -gt 7 })) { Remove-Item -Recurse -Force (Join-Path $SubDir $s.id) -ErrorAction SilentlyContinue }
+}
+
+# ---- Live: what the Tyrone thread and its subthreads are doing, step by step, for Talk ----
+function Live-Body {
+  $job = $null
+  foreach ($d in @(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue)) {
+    if (Test-Path (Join-Path $d.FullName "done.txt")) { continue }
+    $j = Read-Json (Join-Path $d.FullName "job.json")
+    if ($j -and (Is-Running $j)) { $st = Read-Stream $d.FullName; $job = @{ id = $d.Name; task = (Clip ([string]$j.task) 300); startedAt = ([DateTime]::Parse([string]$j.started)).ToUniversalTime().ToString("o"); steps = @($st.steps | Select-Object -Last 10) } }
+  }
+  $day = (Get-Date).ToUniversalTime().AddHours(-24)
+  $subs = @(Get-Subthreads | Where-Object { $_.state -eq "queued" -or $_.state -eq "working" -or ($_.finishedAt -and [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime() -gt $day) } | ForEach-Object {
+    $st = if ($_.state -eq "working") { Read-Stream (Join-Path $SubDir $_.id) } else { $null }
+    $o = [ordered]@{ id = $_.id; title = $_.title; folder = $_.folder; state = $_.state }
+    foreach ($k in "queuedAt", "startedAt", "finishedAt", "branch", "result") { if ($_.$k) { $o[$k] = [string]$_.$k } }
+    if ($st) { $o.steps = @($st.steps | Select-Object -Last 6) }
+    $o
+  })
+  return @{ tyrone = @{ version = $Version; state = $(if ($job) { "working" } else { "idle" }); job = $job; subthreads = $subs; max = $MaxSubthreads } }
+}
+
+$script:LastLive = ""; $script:LastLiveAt = [DateTime]::MinValue
+# Sent when anything changed, and at least every two minutes so the app knows the relay is up.
+function Send-Live([string]$key) {
+  $body = ConvertTo-Json -InputObject (Live-Body) -Depth 8 -Compress
+  if ($body -eq $script:LastLive -and ((Get-Date) - $script:LastLiveAt).TotalSeconds -lt 120) { return }
+  $web = Web $key; $web.Headers["Content-Type"] = "application/json"
+  [void]$web.UploadString($LiveUrl, "POST", $body)
+  $script:LastLive = $body; $script:LastLiveAt = Get-Date
+}
+
+function Busy { return [bool]((@(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { -not (Test-Path (Join-Path $_.FullName "done.txt")) -and (Test-Path (Join-Path $_.FullName "job.json")) }).Count) -or @(Get-Subthreads | Where-Object { $_.state -eq "working" -or $_.state -eq "queued" }).Count) }
+
 function Poll-Jobs([string]$key) {
-  $null = New-Item -ItemType Directory -Force $JobsDir
+  $null = New-Item -ItemType Directory -Force $JobsDir, $SubDir, $WtDir, $SpawnDir
   $tasks = @(((Web $key).DownloadString($TasksUrl) | ConvertFrom-Json).tasks)
   $open = @($tasks | ForEach-Object { [string]$_.id })
   Check-Jobs $key $open
+  # One Tyrone job at a time: the next one starts when it's free.
   $running = @(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { (Test-Path (Join-Path $_.FullName "job.json")) -and -not (Test-Path (Join-Path $_.FullName "done.txt")) }).Count
-  foreach ($t in $tasks) {
-    if (-not $t.claude) { continue }
-    if (Test-Path (Join-Path $JobsDir ([string]$t.id))) { continue }
-    if ($running -ge $MaxRunning) { break }
-    Start-Job $key $t
-    $running++
+  if (-not $running) {
+    $next = $tasks | Where-Object { $_.claude -and -not (Test-Path (Join-Path $JobsDir ([string]$_.id))) } | Select-Object -First 1
+    if ($next) { Start-TyroneJob $key $next }
   }
   # Old job folders go after a week.
   Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) -and (Test-Path (Join-Path $_.FullName "done.txt")) } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -335,6 +552,8 @@ if ($Install) {
   if ($MyInvocation.MyCommand.Path -ne $self) { Copy-Item -LiteralPath $MyInvocation.MyCommand.Path -Destination $self -Force }
   $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$self`" -Base `"$Base`""
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+  # A running older copy stops first, so the new one takes over.
+  if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Tells Tyrone (Project Check-in) what's going on in your Claude Code threads. $self" -Force | Out-Null
   Start-ScheduledTask -TaskName $TaskName
@@ -359,7 +578,11 @@ if ($Doctor) {
     } else { Write-Host "Signed in for jobs: yes" -ForegroundColor Green }
   }
   Write-Host ("Connected to Project Check-in: " + $(if (Get-Key) { "yes" } else { "no (run ClaudeRelay.ps1 -Connect)" }))
-  Write-Host "Folders jobs can run in (where a Claude Code thread ran in the last 30 days):"
+  $h = Get-Home
+  Write-Host ("The Tyrone thread works in: " + $(if ($h) { $h } else { "nowhere yet (no project folders found)" }))
+  $ty = Get-Tyrone
+  Write-Host ("Tyrone thread session: " + $(if ($ty.sessionId) { $ty.sessionId } else { "not started yet (the first job starts it)" }))
+  Write-Host "Projects it and its subthreads can work on (where a Claude Code thread ran in the last 30 days):"
   (Get-JobFolders).Values | Sort-Object { $_.name } | ForEach-Object { Write-Host ("  " + $_.name + "  " + $_.path) }
   exit 0
 }
@@ -373,8 +596,8 @@ if ($Once) { try { Log (Send-Threads $key); exit 0 } catch { Log ("Not sent: " +
 # One relay at a time.
 $mutex = New-Object System.Threading.Mutex($false, "Local\ClaudeRelay")
 if (-not $mutex.WaitOne(0)) { Write-Host "The Claude relay is already running." -ForegroundColor Yellow; exit 0 }
-Log "Claude relay $Version running: sending your threads every two minutes, checking for jobs every 20 seconds."
-$lastNote = ""; $lastJobNote = ""; $nextThreads = Get-Date
+Log "Claude relay $Version running: sending your threads every two minutes, jobs to the Tyrone thread (up to $MaxSubthreads subthreads), live steps while anything runs."
+$lastNote = ""; $lastJobNote = ""; $lastLiveNote = ""; $nextThreads = Get-Date; $nextJobs = Get-Date
 while ($true) {
   $key = Get-Key
   if ((Get-Date) -ge $nextThreads) {
@@ -384,8 +607,14 @@ while ($true) {
     $nextThreads = (Get-Date).AddMinutes(2)
   }
   if ($key) {
-    $jobNote = try { Poll-Jobs $key; "" } catch { "Jobs not checked: " + (Why $_) }
-    if ($jobNote -ne $lastJobNote) { if ($jobNote) { Log $jobNote }; $lastJobNote = $jobNote }
+    if ((Get-Date) -ge $nextJobs) {
+      $jobNote = try { Poll-Jobs $key; "" } catch { "Jobs not checked: " + (Why $_) }
+      if ($jobNote -ne $lastJobNote) { if ($jobNote) { Log $jobNote }; $lastJobNote = $jobNote }
+      $nextJobs = (Get-Date).AddSeconds(20)
+    }
+    $liveNote = try { Check-Subs; Send-Live $key; "" } catch { "Live not sent: " + (Why $_) }
+    if ($liveNote -ne $lastLiveNote) { if ($liveNote) { Log $liveNote }; $lastLiveNote = $liveNote }
   }
-  Start-Sleep -Seconds 20
+  # Every few seconds while anything runs, so Talk shows each step; every 20 seconds otherwise.
+  Start-Sleep -Seconds $(if (Busy) { 3 } else { 20 })
 }

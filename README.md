@@ -89,12 +89,14 @@ Connects Tyrone to your Claude Code threads. Run it on the PC where the Claude d
 
 **What's going on.** Every two minutes it reads the desktop app's session files on that PC and sends Project Check-in the list: each thread's name, folder, whether it's working, waiting on you or done, its last report and what it needs from you.
 
-**Jobs (2.0).** Every 20 seconds it picks up the Claude Code jobs you asked Tyrone to send ("tell the project-checkin thread to make the Ask button focus the box", "have Claude Code fix the recorder in wired"). Tyrone reads each job back and sends it only after you say yes. On the PC:
+**Jobs: the Tyrone thread (3.0).** Every Claude Code job you ask Tyrone to send goes to one Claude Code thread on the PC, the Tyrone thread. Tyrone reads each job back and sends it only after you say yes. On the PC:
 
-- It runs only in your project folders: a folder where a Claude Code thread has run in the last 30 days (never the app's scratch or temp folders, or a folder that holds other projects). `-Doctor` lists them.
-- A job for a thread picks up from a copy of that thread's conversation (`--resume … --fork-session`), so the thread itself is untouched; otherwise it starts fresh in the folder.
-- It runs in the background with this PC's Claude Code (the copy the desktop app keeps), with file edits allowed and any command your project hasn't already allowed refused (`--permission-mode acceptEdits`); the result says what was skipped. At most two at once, 45 minutes each. Cancelling the job on Project Check-in stops it.
-- The result (Claude Code's own summary) goes back to Tyrone, into your Tyrone chat, and by phone if you asked for a call back.
+- The Tyrone thread is one Claude Code session in the folder that holds your projects (the most common parent of your project folders, under your profile). Each job picks the same session up again (`--resume`), one job at a time, so it remembers the jobs before it. `-Doctor` shows where it works and its session.
+- It does a small job itself. For a job with separate parts it starts subthreads: it writes a small file into `%LOCALAPPDATA%\ClaudeRelay\spawn` and the relay starts each one, up to 5 at once (more wait their turn). It can stop one it doesn't need with a `stop-<id>.json` file there.
+- Each subthread runs in its own git worktree of one project, on its own branch (`tyrone/<name>-<id>`). When it finishes, the relay commits its changes to that branch, removes the worktree and keeps the branch (or deletes it if nothing changed). Nothing is merged into a main branch; that's yours to do, or to ask for. A project without git gets one subthread at a time.
+- Only your project folders: folders where a Claude Code thread has run in the last 30 days (never the app's scratch or temp folders).
+- Everything runs in the background with this PC's Claude Code (the copy the desktop app keeps), with file edits allowed and any command your project hasn't already allowed refused (`--permission-mode acceptEdits`). 45 minutes at most for each. Cancelling a job on Project Check-in stops it.
+- Live: while anything runs, every few seconds it sends what the Tyrone thread and each subthread are doing, step by step ("Reading talk-chat.tsx", "Editing actions.ts", "Running: npm test"), and Talk shows it as it happens. Results go back to Tyrone and your Tyrone chat (each subthread's too), and by phone if you asked for a call back.
 
 Setup:
 
@@ -102,7 +104,7 @@ Setup:
 2. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Doctor`. The desktop app signs in only its own threads, so the first time it shows one command to sign Claude Code in for jobs (`claude.exe auth login`, which opens your browser). Run that once yourself.
 3. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Install` copies it to `%LOCALAPPDATA%\ClaudeRelay` and starts it hidden at every sign-in (a scheduled task named Claude relay). Run it again after downloading a new version.
 
-`-DryRun` shows what it would send; `-Once` sends the thread list once; `-Uninstall` removes the scheduled task. Its log is `%LOCALAPPDATA%\ClaudeRelay\relay.log`, and each job's prompt and output are kept for a week in `%LOCALAPPDATA%\ClaudeRelay\jobs`. Revoke the key on Project Check-in's Datalink page.
+`-DryRun` shows what it would send; `-Once` sends the thread list once; `-Uninstall` removes the scheduled task. Its log is `%LOCALAPPDATA%\ClaudeRelay\relay.log`, and each job's and subthread's prompt and output are kept for a week in `%LOCALAPPDATA%\ClaudeRelay\jobs` and `\subthreads`. Revoke the key on Project Check-in's Datalink page.
 
 Tested on 2026-11-26: Tyrone sent a Claude Code job through the relay to this PC.
 
