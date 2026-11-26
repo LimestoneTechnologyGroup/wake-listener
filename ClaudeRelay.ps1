@@ -8,12 +8,13 @@
 #    anything it needs from you) and sends that list to Project Check-in with its
 #    own key, so "what's going on in my threads?" gets an answer.
 # 2. Every Claude Code job Tyrone sends goes to one Tyrone thread: a Claude
-#    Code session on this PC, in the folder that holds your projects, picked up
-#    again for each job (one at a time), so it remembers what came before. It
-#    does a small job itself, or hands parts to subthreads that run at the same
-#    time (up to 5): each in its own git worktree of one project, on its own
-#    branch (tyrone/...), committed by the relay when it finishes and then
-#    closed. Nothing is merged into a main branch. File edits are allowed; any
+#    Code session on this PC, picked up again for each job (one at a time), so
+#    it remembers what came before. It works in its own folder, outside your
+#    projects, and only dispatches: every change, however small, goes to a
+#    subthread (up to 5 run at once), each in its own git worktree of one
+#    project, on its own branch (tyrone/...), committed by the relay when it
+#    finishes and then closed. Nothing ever lands on the branch you work on,
+#    and nothing is merged into a main branch. File edits are allowed; any
 #    command your project hasn't allowed is refused. Results go back to Tyrone
 #    and your chat. Claude Code here needs signing in once: see -Doctor.
 # 3. While anything runs, every few seconds it sends what the Tyrone thread and
@@ -33,7 +34,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "3.0.0"
+$Version = "3.1.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -47,6 +48,8 @@ $SubDir = Join-Path $Folder "subthreads"
 $SpawnDir = Join-Path $Folder "spawn"
 $WtDir = Join-Path $Folder "wt"
 $TyroneFile = Join-Path $Folder "tyrone.json"
+# The Tyrone thread works here, outside every project: it can't change a project itself, so every change goes on a branch.
+$TyroneHome = Join-Path $Folder "tyrone"
 $MaxSubthreads = 5
 $JobMinutes = 45
 $null = New-Item -ItemType Directory -Force $Folder
@@ -184,17 +187,6 @@ function Read-Json([string]$path) { if (-not (Test-Path -LiteralPath $path)) { r
 function Write-Json([string]$path, $value) { [IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $value -Depth 6), (New-Object Text.UTF8Encoding($false))) }
 function Clip([string]$s, [int]$max) { $s = ($s -replace '\s+', ' ').Trim(); if ($s.Length -gt $max) { return $s.Substring(0, $max).TrimEnd() + "…" }; return $s }
 
-# The Tyrone thread lives in the folder that holds your projects (C:\...\Projects): the most common parent of the job folders.
-function Get-Home {
-  $paths = @((Get-JobFolders).Values | ForEach-Object { $_.path })
-  if (-not $paths.Count) { return $null }
-  $best = $paths | ForEach-Object { Split-Path $_ -Parent } | Group-Object | Sort-Object Count -Descending | Select-Object -First 1
-  $h = [string]$best.Name
-  if (-not $h.StartsWith($env:USERPROFILE + "\", [StringComparison]::OrdinalIgnoreCase)) { return $null }
-  if (@($env:LOCALAPPDATA, $env:APPDATA, $env:TEMP) | Where-Object { $_ -and $h.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }) { return $null }
-  return $h
-}
-
 # The Tyrone thread's state: its Claude Code session, and notes for its next job (subthreads that finished since).
 function Get-Tyrone { $t = Read-Json $TyroneFile; if (-not $t) { $t = [pscustomobject]@{ sessionId = ""; notes = @() } }; if (-not $t.notes) { $t | Add-Member -Force notes @() }; return $t }
 function Add-Note([string]$text) { $t = Get-Tyrone; $t.notes = @(@($t.notes) + $text | Select-Object -Last 20); Write-Json $TyroneFile $t }
@@ -280,15 +272,15 @@ function Tyrone-Prompt($t, [string]$homeDir, $notes) {
   $hint = if ($t.claude.folder) { "`nTyrone named the project: $($t.claude.folder)." } else { "" }
   $since = if (@($notes).Count) { "`nSince your last job:`n" + ((@($notes) | ForEach-Object { "- " + $_ }) -join "`n") + "`n" } else { "" }
   return @"
-You are the Tyrone thread: $from's one Claude Code thread for jobs sent by Tyrone, $from's assistant, from a phone call or chat. You run in the background with no one watching, in $homeDir, which holds $from's projects:
+You are the Tyrone thread: $from's one Claude Code thread for jobs sent by Tyrone, $from's assistant, from a phone call or chat. You run in the background with no one watching, and you only dispatch: you can't see or change the projects from here. $from's projects:
 $projects
 $since
 New job from ${from}:$hint
 $($t.task)
 
 How to work:
-- A small job in one project: do it yourself, working only in that project's folder.
-- A job with separate parts, or a long one: hand parts to subthreads, which run at the same time, up to 5 at once (more wait their turn). To start one, write a file into $SpawnDir named <short-name>.json, with {"title": "a few words", "folder": "<one project name from the list>", "task": "complete instructions: the subthread knows nothing else"}. Each subthread works on its own git branch in its own copy of that project; the relay commits its changes to that branch and closes it when it's done, and nothing is merged into the main branch unless $from asks. Never start two subthreads on the same project for parts that touch the same files.
+- Every change, however small, goes to a subthread: never edit a project yourself. One subthread is right for a job in one project; a job with separate parts gets one subthread per part, and they run at the same time, up to 5 at once (more wait their turn).
+- A question you can answer from what's above (what earlier subthreads found or changed) needs no subthread: just answer it. To start one, write a file into $SpawnDir named <short-name>.json, with {"title": "a few words", "folder": "<one project name from the list>", "task": "complete instructions: the subthread knows nothing else"}. Each subthread works on its own git branch in its own copy of that project; the relay commits its changes to that branch and closes it when it's done, and nothing is merged into the main branch unless $from asks. Never start two subthreads on the same project for parts that touch the same files.
 - To stop a subthread that isn't needed any more, write $SpawnDir\stop-<its id>.json (any content).
 Running or waiting subthreads now:
 $(if ($running) { $running } else { "- none" })
@@ -303,11 +295,15 @@ function Start-TyroneJob($key, $t) {
   if (Test-Path $dir) { return }
   $null = New-Item -ItemType Directory -Force $dir
   $problem = Claude-Problem
-  $homeDir = Get-Home
-  if (-not $problem -and -not $homeDir) { $problem = "No project folders were found on this PC (where a Claude Code thread ran in the last 30 days), so the Tyrone thread has nowhere to work." }
+  if (-not $problem -and -not @((Get-JobFolders).Values).Count) { $problem = "No project folders were found on this PC (where a Claude Code thread ran in the last 30 days), so there's nowhere for the work to go." }
+  $homeDir = $TyroneHome
+  $null = New-Item -ItemType Directory -Force $homeDir
   if ($problem) { Report $key $id "failed" $problem | Out-Null; Set-Content (Join-Path $dir "done.txt") "failed: not ready"; Log "Job $id not run: $problem"; return }
   $null = New-Item -ItemType Directory -Force $SpawnDir
   $state = Get-Tyrone
+  # A session from before it moved to its own folder can't be picked up from here: start a new one (its notes carry over).
+  if ($state.sessionId -and [string]$state.home -ne $homeDir) { $state.sessionId = "" }
+  $state | Add-Member -Force home $homeDir
   $notes = @($state.notes)
   $extra = @("--add-dir", $SpawnDir)
   if ($state.sessionId) { $extra += @("--resume", [string]$state.sessionId) }
@@ -578,8 +574,7 @@ if ($Doctor) {
     } else { Write-Host "Signed in for jobs: yes" -ForegroundColor Green }
   }
   Write-Host ("Connected to Project Check-in: " + $(if (Get-Key) { "yes" } else { "no (run ClaudeRelay.ps1 -Connect)" }))
-  $h = Get-Home
-  Write-Host ("The Tyrone thread works in: " + $(if ($h) { $h } else { "nowhere yet (no project folders found)" }))
+  Write-Host ("The Tyrone thread works in: $TyroneHome (outside your projects: every change goes to a subthread, on its own branch)")
   $ty = Get-Tyrone
   Write-Host ("Tyrone thread session: " + $(if ($ty.sessionId) { $ty.sessionId } else { "not started yet (the first job starts it)" }))
   Write-Host "Projects it and its subthreads can work on (where a Claude Code thread ran in the last 30 days):"
