@@ -16,7 +16,7 @@
 
 param([switch]$Test)
 
-$Version = "6.3.1"
+$Version = "6.4.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Tyrone"   # what you'll say (two or three words work best)
@@ -345,6 +345,7 @@ namespace WakeListenerWindows {
       return text.ToString().IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) >= 0;
     }
     public static bool Visible(IntPtr w) { return w != IntPtr.Zero && IsWindowVisible(w); }
+    public static string TitleOf(IntPtr w) { if (w == IntPtr.Zero) return ""; var t = new StringBuilder(512); GetWindowText(w, t, t.Capacity); return t.ToString(); }
     public static void Hide(IntPtr w) { if (w != IntPtr.Zero) ShowWindow(w, 0); }
     public static bool Reveal(IntPtr w) { if (w == IntPtr.Zero) return false; ShowWindow(w, IsIconic(w) ? 9 : 5); return SetForegroundWindow(w); }
     public static bool HasWindow(string titlePart) {
@@ -454,12 +455,13 @@ $script:activity = New-Object WakeUi.Activity("Wake listener " + $Version)
 # meeting, the last talk with Tyrone (read from Project Check-in with your key).
 $GlanceUrl = ($Url -replace "/assistant.*$", "") + "/api/teams/messages/intake/summary"
 $script:pillColors = @{
-  listening = [System.Drawing.Color]::FromArgb(74, 222, 128); open = [System.Drawing.Color]::FromArgb(96, 165, 250)
+  listening = [System.Drawing.Color]::FromArgb(74, 222, 128); open = [System.Drawing.Color]::FromArgb(96, 165, 250); connecting = [System.Drawing.Color]::FromArgb(147, 197, 253)
   paused = [System.Drawing.Color]::FromArgb(148, 163, 184); setup = [System.Drawing.Color]::FromArgb(251, 191, 36)
   problem = [System.Drawing.Color]::FromArgb(248, 113, 113)
 }
 $pill = New-Object WakeUi.Pill
-$pill.Display("Starting", $script:pillColors.setup, "", "", -1)
+$pill.Expanded = ((Get-Setting "expanded") -eq "1")
+$pill.Display("Starting", $script:pillColors.setup, "", "", -1, "")
 $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $at = New-Object System.Drawing.Point(($area.Right - $pill.Width - 24), ($area.Bottom - $pill.Height - 24))
 $placed = Get-Setting "button"
@@ -599,17 +601,47 @@ function Get-GlanceLine {
   return ($parts -join " · ")
 }
 
+# The larger view: each chosen item under its own heading, in full.
+function Get-GlanceDetails {
+  $shown = Get-Shown
+  if (-not $script:glance) {
+    $why = if ($script:glanceProblem) { $script:glanceProblem } else { "Reading your day..." }
+    return "#Your day`n" + $why
+  }
+  $g = $script:glance; $out = @()
+  if ($shown -contains "due") {
+    $out += "#Due today (" + $g.dueToday + $(if ($g.overdue) { ", $($g.overdue) late" } else { "" }) + ")"
+    if ($g.today -and @($g.today).Count) { foreach ($t in @($g.today)) { $out += ($t.title + $(if ($t.overdue) { " (late)" } else { "" })) } } else { $out += "Nothing due today." }
+    if ($g.dueToday -gt @($g.today).Count) { $out += ("...and " + ($g.dueToday - @($g.today).Count) + " more") }
+  }
+  if ($shown -contains "kitchen") {
+    $out += "#Kitchen ($($g.kitchen))"
+    if ($g.kitchenOrders -and @($g.kitchenOrders).Count) { $out += @($g.kitchenOrders) } else { $out += "No orders waiting." }
+  }
+  if ($shown -contains "next") {
+    $out += "#Next meeting"
+    $out += $(if ($g.nextMeeting) { $g.nextMeeting.subject + ", " + ([datetime]$g.nextMeeting.start).ToString("ddd h:mm tt") } else { "Nothing else on your calendar." })
+  }
+  if ($shown -contains "last") {
+    $out += "#Last talk with Tyrone"
+    $out += $(if ($g.lastTalk) { ([datetime]$g.lastTalk.at).ToString("ddd h:mm tt") + $(if ($g.lastTalk.summary) { ": " + $g.lastTalk.summary } else { "" }) } else { "None yet." })
+  }
+  if (-not $out.Count) { return "#Your day`nChoose what to show: right-click > Show on the button." }
+  return ($out | ForEach-Object { ($_ -replace "[\r\n]+", " ") }) -join "`n"
+}
+
 # Puts the current state on the button.
 function Update-Pill {
   $state, $word = if ($script:setupNeeded) { "setup", "Setting up" }
-    elseif ($script:assistantOpen) { "open", "Talking" }
+    elseif ($script:assistantOpen -and $script:onCall) { "open", "On a call" }
+    elseif ($script:assistantOpen) { "connecting", "Connecting" }
     elseif ($script:paused) { "paused", "Paused" }
     elseif (-not $script:micName) { "problem", "No microphone" }
     elseif (-not $script:ears) { "setup", "Starting" }
-    else { "listening", "Listening" }
+    else { "listening", "Sleeping" }
   $action = if ($script:setupNeeded) { "" } elseif ($script:assistantOpen) { "Stop" } else { "Start" }
   $lvl = if ($state -eq "listening") { [int]([Math]::Round([Math]::Min(100, [Math]::Max(0, $script:level)) / 10) * 10) } else { -1 }
-  if ($pill.Visible) { $pill.Display($word, $script:pillColors[$state], (Get-GlanceLine), $action, $lvl) }
+  if ($pill.Visible) { $pill.Display($word, $script:pillColors[$state], (Get-GlanceLine), $action, $lvl, (Get-GlanceDetails)) }
 }
 # What was done with it.
 function Step-Pill {
@@ -629,6 +661,7 @@ function Step-Pill {
       "activity" { Set-WindowShown $true }
       "menu" { $script:tray.ContextMenu.Show($pill, $pill.PointToClient([System.Windows.Forms.Cursor]::Position)) }
       "moved|*" { Set-Setting "button" $click.Substring(6) }
+      "expanded|*" { Set-Setting "expanded" $click.Substring(9); $script:glanceAt = [datetime]::MinValue }
     }
   }
   if ($script:connectRequested) { $script:connectRequested = $false; Connect-App }
@@ -887,6 +920,7 @@ while (-not $script:quit) {
   if ((Get-Date) -ge $nextWindowCheck) {
     $nextWindowCheck = (Get-Date).AddSeconds(1)
     $open = (Test-AssistantOpen) -or (((Get-Date) - $last).TotalSeconds -lt $GraceSecs)
+    $script:onCall = $open -and ([WakeListenerWindows.Browser]::TitleOf([WakeListenerWindows.Browser]::Find($AssistantTitle)) -like "On a call*")
     if ($open -and -not $handedOver) {
       $handedOver = $true
       Stop-Listening

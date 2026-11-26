@@ -12,15 +12,18 @@ namespace WakeUi {
   /// The floating Tyrone button: a rounded pill drawn into a per-pixel-alpha
   /// (layered) window, so its edges are smooth and it never flickers. It only
   /// redraws when what it shows changes. What you do with it comes out as
-  /// events: "start", "stop", "front", "activity", "menu", "moved|x,y".
+  /// events: "start", "stop", "front", "activity", "menu", "moved|x,y",
+  /// "expanded|1" or "expanded|0" (the arrow opens and closes the larger view).
   /// </summary>
   public class Pill : Form {
     public readonly ConcurrentQueue<string> Clicks = new ConcurrentQueue<string>();
-    string title = "Tyrone", status = "Starting", info = "", action = "";
+    string title = "Tyrone", status = "Starting", info = "", action = "", details = "";
+    /// <summary>Showing the larger view: each detail on its own line.</summary>
+    public bool Expanded;
     Color dot = Color.FromArgb(251, 191, 36);
     int level = -1;
     float scale = 1f;
-    Rectangle actionBox = Rectangle.Empty;
+    Rectangle actionBox = Rectangle.Empty, arrowBox = Rectangle.Empty;
     Point downAt; bool dragging, down;
 
     [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref Point pptDst, ref Size psize, IntPtr hdcSrc, ref Point pptSrc, int crKey, ref Blend pblend, int dwFlags);
@@ -42,9 +45,11 @@ namespace WakeUi {
     protected override bool ShowWithoutActivation { get { return true; } }
 
     /// <summary>What it shows. Redraws only when something changed.</summary>
-    public void Display(string status, Color dot, string info, string action, int level) {
-      if (status == this.status && dot == this.dot && info == this.info && action == this.action && level == this.level && Visible) return;
-      this.status = status; this.dot = dot; this.info = info ?? ""; this.action = action ?? ""; this.level = level;
+    /// <param name="details">The larger view's lines, one per line; a line starting "#" is a heading.</param>
+    public void Display(string status, Color dot, string info, string action, int level, string details) {
+      details = details ?? "";
+      if (status == this.status && dot == this.dot && info == this.info && action == this.action && level == this.level && details == this.details && Visible) return;
+      this.status = status; this.dot = dot; this.info = info ?? ""; this.action = action ?? ""; this.level = level; this.details = details;
       Render();
     }
 
@@ -54,7 +59,10 @@ namespace WakeUi {
       if (!IsHandleCreated) CreateHandle();
       {
         // Drawn in pixels at the screen's DPI, so it's sharp on a scaled display.
-        int w = S(info.Length > 0 ? 260 : 220), h = S(info.Length > 0 ? 66 : 50);
+        var lines = Expanded ? details.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries) : new string[0];
+        bool showInfo = !Expanded && info.Length > 0;
+        int w = S(Expanded ? 320 : showInfo ? 270 : 240);
+        int h = Expanded ? S(58) + lines.Length * S(19) + S(10) : S(showInfo ? 66 : 50);
         using (var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb))
         using (var g = Graphics.FromImage(bmp)) {
           g.SmoothingMode = SmoothingMode.AntiAlias; g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
@@ -71,7 +79,22 @@ namespace WakeUi {
             g.DrawString(title, tf, Brushes.White, S(38), S(5));
             using (var muted = new SolidBrush(Color.FromArgb(203, 213, 225))) {
               g.DrawString(status, sf, muted, S(39), S(26));
-              if (info.Length > 0) g.DrawString(info, sf, muted, new RectangleF(S(14), S(45), w - S(24), S(18)), new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap });
+              var one = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+              if (showInfo) g.DrawString(info, sf, muted, new RectangleF(S(14), S(45), w - S(24), S(18)), one);
+              // The larger view: a rule, then each line (headings in small capitals).
+              if (Expanded) {
+                using (var rule = new Pen(Color.FromArgb(60, 148, 163, 184), Math.Max(1, scale))) g.DrawLine(rule, S(14), S(50), w - S(14), S(50));
+                using (var hf = new Font("Segoe UI Semibold", 7.5f * 96f / 72f * scale, GraphicsUnit.Pixel))
+                using (var head = new SolidBrush(Color.FromArgb(148, 163, 184)))
+                using (var body = new SolidBrush(Color.FromArgb(226, 232, 240))) {
+                  float y = S(56);
+                  foreach (var raw in lines) {
+                    if (raw.StartsWith("#")) g.DrawString(raw.Substring(1).Trim().ToUpperInvariant(), hf, head, new RectangleF(S(14), y + S(3), w - S(28), S(18)), one);
+                    else g.DrawString(raw, sf, body, new RectangleF(S(18), y, w - S(32), S(19)), one);
+                    y += S(19);
+                  }
+                }
+              }
             }
             // The mic level, a thin bar under the title, while listening.
             if (level >= 0) {
@@ -87,6 +110,15 @@ namespace WakeUi {
               using (var p = Round(actionBox, S(14)))
               using (var b = new SolidBrush(stop ? Color.FromArgb(190, 18, 60) : Color.FromArgb(234, 88, 12))) g.FillPath(b, p);
               g.DrawString(action, bf, Brushes.White, actionBox.X + S(10), actionBox.Y + (actionBox.Height - size.Height) / 2);
+            }
+            // The arrow that opens and closes the larger view.
+            int right = actionBox.IsEmpty ? w - S(14) : actionBox.X - S(6);
+            arrowBox = new Rectangle(right - S(26), S(12), S(26), S(26));
+            using (var ring = new SolidBrush(Color.FromArgb(50, 148, 163, 184))) g.FillEllipse(ring, arrowBox);
+            using (var pen = new Pen(Color.White, Math.Max(1.5f, 1.6f * scale)) { StartCap = LineCap.Round, EndCap = LineCap.Round }) {
+              float cx = arrowBox.X + arrowBox.Width / 2f, cy = arrowBox.Y + arrowBox.Height / 2f, d = S(4);
+              if (Expanded) g.DrawLines(pen, new[] { new PointF(cx - d, cy + d / 2), new PointF(cx, cy - d / 2), new PointF(cx + d, cy + d / 2) });
+              else g.DrawLines(pen, new[] { new PointF(cx - d, cy - d / 2), new PointF(cx, cy + d / 2), new PointF(cx + d, cy - d / 2) });
             }
           }
           Apply(bmp);
@@ -108,7 +140,13 @@ namespace WakeUi {
       Last = (Bitmap)bmp.Clone();
       IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen), hbmp = bmp.GetHbitmap(Color.FromArgb(0)), old = SelectObject(mem, hbmp);
       try {
-        var size = new Size(bmp.Width, bmp.Height); var src = new Point(0, 0); var dst = new Point(Left, Top);
+        var size = new Size(bmp.Width, bmp.Height); var src = new Point(0, 0);
+        if (IsHandleCreated && Height > 0 && size.Height != Height) {
+          var area = Screen.FromPoint(new Point(Left + Width / 2, Top + Height / 2)).WorkingArea;
+          if (Top + Height / 2 > area.Top + area.Height / 2) Top -= size.Height - Height;
+          if (Left + size.Width > area.Right) Left = area.Right - size.Width - S(8);
+        }
+        var dst = new Point(Left, Top);
         var blend = new Blend { Op = 0, Flags = 0, Alpha = 255, Format = 1 };
         Size = size;
         UpdateLayeredWindow(Handle, screen, ref dst, ref size, mem, ref src, 0, ref blend, 2);
@@ -130,10 +168,11 @@ namespace WakeUi {
       down = false;
       if (dragging) { Clicks.Enqueue("moved|" + Left + "," + Top); return; }
       if (actionBox.Contains(e.Location)) Clicks.Enqueue(action == "Stop" ? "stop" : "start");
+      else if (arrowBox.Contains(e.Location)) { Expanded = !Expanded; Clicks.Enqueue("expanded|" + (Expanded ? "1" : "0")); Render(); }
       else Clicks.Enqueue("front");
     }
     protected override void OnMouseDoubleClick(MouseEventArgs e) {
-      if (e.Button == MouseButtons.Left && !actionBox.Contains(e.Location)) Clicks.Enqueue("activity");
+      if (e.Button == MouseButtons.Left && !actionBox.Contains(e.Location) && !arrowBox.Contains(e.Location)) Clicks.Enqueue("activity");
     }
   }
 
