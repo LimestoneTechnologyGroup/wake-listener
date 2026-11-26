@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Ship = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "3.3.0"
+$Version = "3.3.1"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -57,7 +57,7 @@ $TyroneHome = Join-Path $Folder "tyrone"
 $MaxSubthreads = 5
 # What a subthread may run without asking (Zack, 2026-11-26): its project's checks, and committing on its own
 # branch. Never push, deploy, switch branches or delete: anything else is refused.
-$CheckCommands = @("npm run test", "npm run typecheck", "npm run lint", "npm run check", "npm test", "npx tsc", "npx vitest", "npx eslint", "npx playwright test", "node --check", "python -m pytest", "pytest", "git status", "git diff", "git log", "git show", "git add", "git commit")
+$CheckCommands = @("npm run test", "npm run typecheck", "npm run lint", "npm run check", "npm test", "npx tsc", "npx vitest", "npx eslint", "npx playwright test", "node --check", "python -m pytest", "pytest", "python -m unittest", "py -m pytest", "py -m unittest", "python -m py_compile", "git status", "git diff", "git log", "git show", "git add", "git commit")
 $SubthreadTools = @($CheckCommands | ForEach-Object { "Bash($($_):*)"; "PowerShell($($_):*)" })
 $JobMinutes = 45
 # Going live (Zack, 2026-11-26: "push all the way to dev, if I can see it in the chat"). A subthread that committed
@@ -278,7 +278,21 @@ function Start-Claude([string]$dir, [string]$where, [string[]]$extra, [string]$p
   $cliArgs = @("-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits") + $extra
   # PowerShell 5.1 joins ArgumentList with spaces and no quoting: anything with a space ("Bash(npm test:*)") is quoted here.
   $line = ($cliArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join " "
-  return Start-Process -FilePath (Find-Claude) -ArgumentList $line -WorkingDirectory $where -RedirectStandardInput (Join-Path $dir "prompt.txt") -RedirectStandardOutput (Join-Path $dir "out.json") -RedirectStandardError (Join-Path $dir "err.txt") -NoNewWindow -PassThru
+  # The project's own tools first on the PATH (its .venv's Python, its node_modules\.bin), found by walking up from
+  # where it runs (a worktree sits inside its project), so "python -m unittest" or "npm test" runs as it does for them.
+  $savedPath = $env:PATH; $savedVenv = $env:VIRTUAL_ENV
+  try {
+    $first = @(); $at = $where
+    while ($at -and $first.Count -lt 2) {
+      $venv = Join-Path $at ".venv"
+      if (-not $env:VIRTUAL_ENV -and (Test-Path (Join-Path $venv "Scripts\python.exe"))) { $first += (Join-Path $venv "Scripts"); $env:VIRTUAL_ENV = $venv }
+      $bin = Join-Path $at "node_modules\.bin"
+      if ((Test-Path $bin) -and -not ($first -contains $bin)) { $first += $bin }
+      $up = Split-Path $at -Parent; if (-not $up -or $up -eq $at) { break }; $at = $up
+    }
+    if ($first.Count) { $env:PATH = (($first | Select-Object -Unique) -join ";") + ";" + $savedPath }
+    return Start-Process -FilePath (Find-Claude) -ArgumentList $line -WorkingDirectory $where -RedirectStandardInput (Join-Path $dir "prompt.txt") -RedirectStandardOutput (Join-Path $dir "out.json") -RedirectStandardError (Join-Path $dir "err.txt") -NoNewWindow -PassThru
+  } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv }
 }
 
 function Is-Running($job) { $p = Get-Process -Id ([int]$job.pid) -ErrorAction SilentlyContinue; return $p -and -not $p.HasExited -and $p.ProcessName -match "claude" }
