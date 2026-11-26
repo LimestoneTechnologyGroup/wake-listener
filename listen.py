@@ -113,8 +113,10 @@ def listen(folder, phrase, sensitivity, wav=None):
             rate = w.getframerate()
         say("ready", "recording " + os.path.basename(wav))
         step = rate // 10
+        realtime = "--realtime" in sys.argv
         for i in range(0, len(data), step):
             hear(data[i:i + step], rate)
+            if realtime: time.sleep(0.1)
             if (i // step) % 2 == 0:
                 say("level", int(min(100, round((peak[0] ** 0.5) * 100)))); peak[0] = 0
         hear(np.zeros(rate, np.float32), rate)

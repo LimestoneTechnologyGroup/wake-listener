@@ -6,7 +6,7 @@ Since 6.0 the listening is done by a **neural keyword engine** ([sherpa-onnx](ht
 
 ## Install
 
-1. Download **[WakeListener.zip](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest/download/WakeListener.zip)**, right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (Updating: Quit from the tray first, then extract over the same folder.)
+1. Download **[WakeListener.zip](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest/download/WakeListener.zip)**, right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
 2. Double-click **Start wake listener.cmd**. (If Windows asks about running it, choose **Run**.)
 3. **First run: it sets up the engine** (a few minutes, once, needs the internet). The activity window shows each step:
    - Python: it uses yours (3.11 to 3.14), or installs Python 3.12 from python.org for your Windows account only, through winget;
@@ -14,13 +14,23 @@ Since 6.0 the listening is done by a **neural keyword engine** ([sherpa-onnx](ht
    - the 17 MB English model from sherpa-onnx's releases, checked against its published SHA-256 before it's used.
 4. Say **"hey Tyrone"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
 
-It runs as a **tray icon** by the clock. Hover it to see the microphone and the last time it opened. Right-click it to:
+**The floating button** (since 6.1) stays on top of every window, above the clock to start with:
+- a dot and a word say how Tyrone is: green **Listening** (with a bar that moves with your voice), blue **Talking** (the assistant is open), grey **Paused**, amber **Setting up**, red **No microphone**;
+- **click it** to open the assistant, or bring it to the front if it's already open;
+- **drag it** anywhere (it remembers where);
+- **right-click it** for the same menu as the tray icon.
+
+It also runs as a **tray icon** by the clock. Hover it to see the microphone and the last time it opened. Right-click it (or the floating button) to:
 - show the activity window (microphone, live level meter, and each time it hears the phrase),
 - pause,
+- hide or show the floating button,
 - set the **sensitivity** (low, normal, high; it remembers your choice),
 - open the assistant now,
 - set up the engine again,
+- check for updates,
 - quit.
+
+**Updates install themselves** (since 6.1): on start and once a day it checks for a newer release, checks the download's SHA-256, installs it over these files and starts again. Never while the assistant is open. To turn that off, add a line `auto-update=no` to `%LOCALAPPDATA%\WakeListener\settings.txt`; "Check for updates" on the menu still works.
 
 While the assistant is open it lets go of the microphone, and takes it back when the assistant closes.
 

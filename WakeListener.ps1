@@ -16,7 +16,7 @@
 
 param([switch]$Test)
 
-$Version = "6.0.0"
+$Version = "6.1.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Tyrone"   # what you'll say (two or three words work best)
@@ -38,7 +38,19 @@ $ErrorActionPreference = "Stop"
 $ListenPy = Join-Path $PSScriptRoot "listen.py"
 $VenvPython = Join-Path $EngineFolder "py\Scripts\python.exe"
 $SettingsFile = Join-Path $EngineFolder "settings.txt"
-try { $saved = (Get-Content $SettingsFile -ErrorAction Stop | Where-Object { $_ -match "^sensitivity=" }) -replace "^sensitivity=", ""; if ($saved -in @("low", "normal", "high")) { $Sensitivity = $saved } } catch { }
+# Choices made from the tray menu (sensitivity, the floating button), kept as name=value lines.
+function Get-Setting([string]$name) {
+  try { $line = Get-Content $SettingsFile -ErrorAction Stop | Where-Object { $_ -like "$name=*" } | Select-Object -Last 1; if ($line) { return $line.Substring($name.Length + 1) } } catch { }
+  return $null
+}
+function Set-Setting([string]$name, [string]$value) {
+  try {
+    $null = New-Item -ItemType Directory -Force $EngineFolder
+    $lines = @(try { Get-Content $SettingsFile -ErrorAction Stop | Where-Object { $_ -notlike "$name=*" } } catch { })
+    Set-Content -Path $SettingsFile -Value ($lines + "$name=$value") -Encoding ASCII
+  } catch { }
+}
+$saved = Get-Setting "sensitivity"; if ($saved -in @("low", "normal", "high")) { $Sensitivity = $saved }
 
 # listen.py as a child process: its output lines, read in the background, one event each.
 Add-Type -Language CSharp @'
@@ -262,6 +274,7 @@ function Show-Meter {
   $line = "  Mic level [" + ("#" * $bars).PadRight(30, ".") + "] " + ("{0,3}" -f $shown) + "   " + $state
   [Console]::Write("`r" + $line.PadRight((Width)).Substring(0, (Width)))
   $script:meterShown = $true
+  if (Get-Command Update-Bubble -ErrorAction SilentlyContinue) { Update-Bubble }
 }
 
 # ---- The tray icon ----------------------------------------------------------
@@ -286,6 +299,24 @@ namespace WakeListenerWindows {
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr window, StringBuilder text, int max);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr window, int show);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);
+    /// <summary>Brings the browser window whose title contains titlePart to the front (restoring it if minimized).</summary>
+    public static bool Focus(string titlePart) {
+      IntPtr hit = IntPtr.Zero;
+      EnumWindows((w, p) => {
+        var text = new StringBuilder(512);
+        GetWindowText(w, text, text.Capacity);
+        if (text.ToString().IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) < 0) return true;
+        uint pid; GetWindowThreadProcessId(w, out pid);
+        try { var name = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant(); if (name == "msedge" || name == "chrome") { hit = w; return false; } } catch { }
+        return true;
+      }, IntPtr.Zero);
+      if (hit == IntPtr.Zero) return false;
+      if (IsIconic(hit)) ShowWindow(hit, 9);
+      return SetForegroundWindow(hit);
+    }
     public static bool HasWindow(string titlePart) {
       bool found = false;
       EnumWindows((w, p) => {
@@ -336,7 +367,7 @@ foreach ($s in @(@("low", "Low: only when it's sure"), @("normal", "Normal"), @(
   $item.add_Click({
     $script:Sensitivity = $this.Tag
     foreach ($i in $sensItem.MenuItems) { $i.Checked = ($i.Tag -eq $this.Tag) }
-    try { $null = New-Item -ItemType Directory -Force $EngineFolder; Set-Content -Path $SettingsFile -Value ("sensitivity=" + $this.Tag) -Encoding ASCII } catch { }
+    Set-Setting "sensitivity" $this.Tag
     Say ("Sensitivity: " + $this.Tag + ".")
     $script:sensitivityChanged = $true
   })
@@ -364,6 +395,99 @@ function Notify([string]$text) {
 }
 # Waits, keeping the tray menu responsive and the meter moving.
 function Idle([int]$ms) { $until = (Get-Date).AddMilliseconds($ms); while ((Get-Date) -lt $until -and -not $script:quit) { [System.Windows.Forms.Application]::DoEvents(); Show-Meter; Start-Sleep -Milliseconds 100 } }
+
+# ---- The floating button ----------------------------------------------------
+# A small pill that stays on top of every window: a dot and a word say whether
+# Tyrone is listening, the bar under it moves with your voice. Click it to open
+# the assistant (or bring it to the front); drag it anywhere (it remembers where);
+# right-click for the same menu as the tray icon.
+$script:bubbleState = ""
+$script:bubbleColors = @{
+  listening = [System.Drawing.Color]::FromArgb(74, 222, 128); open = [System.Drawing.Color]::FromArgb(96, 165, 250)
+  paused = [System.Drawing.Color]::FromArgb(148, 163, 184); setup = [System.Drawing.Color]::FromArgb(251, 191, 36)
+  problem = [System.Drawing.Color]::FromArgb(248, 113, 113)
+}
+$bubble = New-Object System.Windows.Forms.Form
+$bubble.FormBorderStyle = "None"; $bubble.ShowInTaskbar = $false; $bubble.TopMost = $true
+$bubble.StartPosition = "Manual"; $bubble.Size = New-Object System.Drawing.Size(184, 46)
+$bubble.BackColor = [System.Drawing.Color]::FromArgb(14, 38, 66); $bubble.Opacity = 0.94
+$bubble.Text = "Tyrone"
+$bubble.Cursor = [System.Windows.Forms.Cursors]::Hand
+$path = New-Object System.Drawing.Drawing2D.GraphicsPath
+$r = 22; $w = $bubble.Width; $h = $bubble.Height
+$path.AddArc(0, 0, $r * 2, $h, 90, 180); $path.AddArc($w - $r * 2 - 1, 0, $r * 2, $h, 270, 180); $path.CloseFigure()
+$bubble.Region = New-Object System.Drawing.Region($path)
+$script:bubbleTitle = "Tyrone"; $script:bubbleWord = "Starting"; $script:bubbleColor = $script:bubbleColors.setup
+$titleFont = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
+$wordFont = New-Object System.Drawing.Font("Segoe UI", 8.5)
+$bubble.add_Paint({
+  param($s, $e)
+  $g = $e.Graphics; $g.SmoothingMode = "AntiAlias"
+  $dot = New-Object System.Drawing.SolidBrush($script:bubbleColor)
+  $g.FillEllipse($dot, 16, 17, 12, 12)
+  $g.DrawString($script:bubbleTitle, $titleFont, [System.Drawing.Brushes]::White, 36, 5)
+  $g.DrawString($script:bubbleWord, $wordFont, (New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(203, 213, 225))), 37, 23)
+  # The mic level, while listening.
+  if ($script:bubbleState -eq "listening") {
+    $len = [Math]::Round([Math]::Min(100, [Math]::Max(0, $script:level)) / 100 * 40)
+    $g.FillRectangle((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(51, 65, 85))), 130, 21, 40, 4)
+    if ($len -gt 0) { $g.FillRectangle($dot, 130, 21, $len, 4) }
+  }
+})
+# Drag to move; a click without a drag opens the assistant.
+$script:dragFrom = $null; $script:dragged = $false
+$bubble.add_MouseDown({ param($s, $e) if ($e.Button -eq "Left") { $script:dragFrom = $e.Location; $script:dragged = $false } })
+$bubble.add_MouseMove({
+  param($s, $e)
+  if ($script:dragFrom -and $e.Button -eq "Left") {
+    $dx = $e.X - $script:dragFrom.X; $dy = $e.Y - $script:dragFrom.Y
+    if ([Math]::Abs($dx) + [Math]::Abs($dy) -gt 3) { $script:dragged = $true }
+    if ($script:dragged) { $bubble.Location = New-Object System.Drawing.Point(($bubble.Left + $dx), ($bubble.Top + $dy)) }
+  }
+})
+$bubble.add_MouseUp({
+  param($s, $e)
+  if ($e.Button -ne "Left") { return }
+  $script:dragFrom = $null
+  if ($script:dragged) { Set-Setting "button" ("{0},{1}" -f $bubble.Left, $bubble.Top); return }
+  if (Test-AssistantOpen) { [void][WakeListenerWindows.Browser]::Focus($AssistantTitle) }
+  else { $script:openRequested = $true }
+})
+$bubble.ContextMenu = $script:tray.ContextMenu
+$tip = New-Object System.Windows.Forms.ToolTip
+# Where it was left, if that's still on a screen; otherwise bottom right, above the clock.
+$place = Get-Setting "button"
+$area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$at = New-Object System.Drawing.Point(($area.Right - $bubble.Width - 24), ($area.Bottom - $bubble.Height - 24))
+if ($place -match "^(-?\d+),(-?\d+)$") {
+  $p = New-Object System.Drawing.Point([int]$Matches[1], [int]$Matches[2])
+  if ([System.Windows.Forms.Screen]::AllScreens | Where-Object { $_.WorkingArea.Contains($p) }) { $at = $p }
+}
+$bubble.Location = $at
+
+# Puts the current state on the button: listening, talking (the assistant is open), paused, setting up, or a problem.
+function Update-Bubble {
+  $state, $word = if ($script:setupNeeded) { "setup", "Setting up" }
+    elseif ($script:assistantOpen) { "open", "Talking: click to show" }
+    elseif ($script:paused) { "paused", "Paused" }
+    elseif (-not $script:micName) { "problem", "No microphone" }
+    elseif (-not $script:ears) { "setup", "Starting" }
+    else { "listening", "Listening" }
+  if ($state -ne $script:bubbleState -or $word -ne $script:bubbleWord) {
+    $script:bubbleState = $state; $script:bubbleWord = $word; $script:bubbleColor = $script:bubbleColors[$state]
+    $tip.SetToolTip($bubble, ($script:tray.Text + "`nClick: open Tyrone. Right-click: options. Drag to move."))
+  }
+  if ($bubble.Visible) { $bubble.Invalidate() }
+}
+function Set-BubbleShown([bool]$show) {
+  $script:bubbleItem.Text = if ($show) { "Hide floating button" } else { "Show floating button" }
+  Set-Setting "button-shown" $(if ($show) { "yes" } else { "no" })
+  if ($show) { $bubble.Show() } else { $bubble.Hide() }
+}
+$script:bubbleItem = New-Object System.Windows.Forms.MenuItem("Hide floating button")
+$script:bubbleItem.add_Click({ Set-BubbleShown (-not $bubble.Visible) })
+$script:tray.ContextMenu.MenuItems.Add(1, $script:bubbleItem)
+if ((Get-Setting "button-shown") -ne "no") { $bubble.Show() } else { $script:bubbleItem.Text = "Show floating button" }
 
 # ---- Setting up the engine (first run, or after an update) ------------------
 # A Python of our own (a virtual environment in $EngineFolder) with the engine's
@@ -438,7 +562,7 @@ function Start-Listening {
   Stop-Listening
   $e = New-Object WakeListenerEngine.Ears
   $wav = $env:WAKE_LISTENER_FAKE_MIC
-  $e.Start($VenvPython, ("`"$ListenPy`" `"$EngineFolder`" `"$Phrase`" $Sensitivity" + $(if ($wav) { " --wav `"$wav`"" } else { "" })))
+  $e.Start($VenvPython, ("`"$ListenPy`" `"$EngineFolder`" `"$Phrase`" $Sensitivity" + $(if ($wav) { " --wav `"$wav`" --realtime" } else { "" })))
   $script:ears = $e
   $script:earsStarted = Get-Date
 }
@@ -448,12 +572,73 @@ function Stop-Listening {
 }
 function Why($err) { $e = $err.Exception; while ($e.InnerException) { $e = $e.InnerException }; return $e.Message }
 
+# ---- Updating itself --------------------------------------------------------
+# On start and once a day, it asks GitHub for the latest release. A newer one is
+# downloaded, its checksum checked when GitHub gives one, its script checked to
+# be readable, then copied over these files, and the listener starts again.
+# Never while the assistant is open.
+$UpdateApi = "https://api.github.com/repos/LimestoneTechnologyGroup/wake-listener/releases/latest"
+function Find-Update {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  $r = Invoke-RestMethod -Uri $UpdateApi -Headers @{ "User-Agent" = "WakeListener"; "Accept" = "application/vnd.github+json" } -TimeoutSec 20
+  $latest = [version]($r.tag_name -replace "^v", "")
+  if ($latest -le [version]$Version) { return $null }
+  $asset = $r.assets | Where-Object { $_.name -eq "WakeListener.zip" } | Select-Object -First 1
+  if (-not $asset) { return $null }
+  return [pscustomobject]@{ Version = $latest; Url = $asset.browser_download_url; Digest = $asset.digest; Notes = $r.name }
+}
+function Install-Update($u, [string]$into) {
+  if (-not $into -or -not (Test-Path (Join-Path $into "WakeListener.ps1"))) { throw "the wake listener's folder wasn't found" }
+  $work = Join-Path ([IO.Path]::GetTempPath()) ("wake-listener-update-" + [guid]::NewGuid())
+  $null = New-Item -ItemType Directory $work
+  try {
+    $zip = Join-Path $work "WakeListener.zip"
+    Invoke-WebRequest -Uri $u.Url -OutFile $zip -UseBasicParsing -TimeoutSec 120 -Headers @{ "User-Agent" = "WakeListener" }
+    if ($u.Digest -match "^sha256:([0-9a-f]{64})$") {
+      if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Matches[1]) { throw "the download didn't match its checksum" }
+    }
+    Expand-Archive -Path $zip -DestinationPath (Join-Path $work "x") -Force
+    $script = Join-Path $work "x\WakeListener.ps1"
+    if (-not (Test-Path $script)) { throw "the download has no WakeListener.ps1" }
+    $errs = $null; $null = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$null, [ref]$errs)
+    if ($errs) { throw "the new script didn't read cleanly" }
+    Get-ChildItem (Join-Path $work "x") -File | Copy-Item -Destination $into -Force
+    return $true
+  } finally { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
+}
+function Restart-Listener {
+  $cmd = Join-Path $PSScriptRoot "Start wake listener.cmd"
+  if (Test-Path $cmd) { Start-Process -FilePath $cmd -WorkingDirectory $PSScriptRoot -WindowStyle Minimized }
+  else { Start-Process powershell.exe -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"") -WindowStyle Minimized }
+  $script:quit = $true
+}
+$script:nextUpdateCheck = (Get-Date).AddSeconds(30)
+$script:updateNow = $false
+function Step-Update([bool]$asked) {
+  $script:nextUpdateCheck = (Get-Date).AddHours(24)
+  if ($env:WAKE_LISTENER_FAKE_MIC -or ((Get-Setting "auto-update") -eq "no" -and -not $asked)) { return }
+  try { $u = Find-Update } catch { if ($asked) { Say ("Couldn't check for updates: " + (Why $_)) Yellow }; return }
+  if (-not $u) { if ($asked) { Say "You have the latest version ($Version)." Green }; return }
+  Say ("Updating to " + $u.Version + "...") Cyan
+  try {
+    if (Install-Update $u $PSScriptRoot) {
+      Say ("Updated to " + $u.Version + ": starting it again.") Green
+      $script:tray.ShowBalloonTip(5000, "Wake listener updated", ("Now on " + $u.Version + ". It's starting again."), [System.Windows.Forms.ToolTipIcon]::Info)
+      Restart-Listener
+    }
+  } catch { Say ("The update to " + $u.Version + " didn't install: " + (Why $_) + " It'll try again tomorrow, or choose 'Check for updates' from the tray icon.") Yellow }
+}
+$updateItem = New-Object System.Windows.Forms.MenuItem("Check for updates")
+$updateItem.add_Click({ $script:updateNow = $true })
+$script:tray.ContextMenu.MenuItems.Add($script:tray.ContextMenu.MenuItems.Count - 2, $updateItem) | Out-Null
+
 # ---- Start ------------------------------------------------------------------
 Clear-Host
 Write-Host "Wake listener $Version" -ForegroundColor White
 Write-Host "Say `"$Phrase`" and your assistant opens. A neural keyword engine listens, on this PC only."
 Write-Host "Opens: $Url"
 Write-Host "This window hides itself: the tray icon by the clock keeps listening, whatever window is in front."
+Write-Host "The floating button shows whether Tyrone is listening: click it to open him, drag it anywhere, right-click for options."
 Write-Host "Right-click the tray icon to show this window again, pause, change the sensitivity, or quit."
 Write-Host "(If you click inside this window it pauses until you press Esc.)"
 Write-Host ""
@@ -481,6 +666,20 @@ $handedOver = $false
 $nextWindowCheck = Get-Date
 
 while (-not $script:quit) {
+  $script:setupNeeded = $needSetup; $script:assistantOpen = $handedOver
+  # The floating button was clicked: open the assistant now.
+  if ($script:openRequested) {
+    $script:openRequested = $false
+    if (-not $handedOver -and -not $needSetup) {
+      Say "Opening the assistant (the floating button)." Cyan
+      $script:lastHeard = (Get-Date -Format "HH:mm") + " opened"; Set-TrayText
+      $last = Get-Date
+      Stop-Listening
+      $handedOver = $true; $script:assistantOpen = $true
+      try { Open-Assistant } catch { Say ("Couldn't open the assistant: " + $_.Exception.Message) Red }
+      continue
+    } elseif (-not $needSetup) { try { Open-Assistant } catch { } }
+  }
   # Setting up the engine: on the first run, and when asked from the tray.
   if (($needSetup -and (Get-Date) -ge $nextSetupTry) -or $script:setupRequested) {
     $script:setupRequested = $false
@@ -511,6 +710,13 @@ while (-not $script:quit) {
   if ($handedOver -or $needSetup) {
     [System.Windows.Forms.Application]::DoEvents(); Show-Meter; Start-Sleep -Milliseconds 100
     continue
+  }
+
+  # A newer version: on start, once a day, or when asked from the tray.
+  if ($script:updateNow -or (Get-Date) -ge $script:nextUpdateCheck) {
+    $asked = $script:updateNow; $script:updateNow = $false
+    Step-Update $asked
+    if ($script:quit) { break }
   }
 
   # A new sensitivity from the tray: listen again with it.
@@ -605,5 +811,6 @@ while (-not $script:quit) {
 
 # Quit from the tray: tidy up.
 Stop-Listening
+$bubble.Close()
 $script:tray.Visible = $false
 $script:tray.Dispose()
