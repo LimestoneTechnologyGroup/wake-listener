@@ -34,7 +34,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "3.1.0"
+$Version = "3.1.1"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -379,6 +379,8 @@ function Take-Spawns {
 }
 
 function Close-Worktree($s) {
+  # Git writes notices (line endings, "Preparing worktree") to stderr; they mustn't stop the relay halfway.
+  $ErrorActionPreference = "Continue"
   if (-not $s.worktree) { return }
   $wt = [string]$s.worktree
   if (Test-Path -LiteralPath $wt) {
@@ -394,6 +396,7 @@ function Close-Worktree($s) {
 }
 
 function Start-Sub($s) {
+  $ErrorActionPreference = "Continue"
   $dir = Join-Path $SubDir $s.id
   $where = [string]$s.path
   if (Test-Path -LiteralPath (Join-Path $where ".git")) {
