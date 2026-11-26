@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "4.0.1"
+$Version = "4.0.2"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -207,6 +207,28 @@ function Claude-Problem {
 
 function Read-Json([string]$path) { if (-not (Test-Path -LiteralPath $path)) { return $null }; try { return ([IO.File]::ReadAllText($path) | ConvertFrom-Json) } catch { return $null } }
 function Write-Json([string]$path, $value) { [IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $value -Depth 6), (New-Object Text.UTF8Encoding($false))) }
+# Runs one check in the current folder and returns its output as plain text. Node and Python
+# write UTF-8, so it's read as UTF-8 (the console's code page turned "…" into "ΓÇª"), and
+# colour codes and rule lines are dropped, so a failure reads cleanly in the chat.
+# $LASTEXITCODE is left as the check's.
+function Run-Check([string]$c) {
+  $savedEnc = $null
+  try { $savedEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
+  try { $out = (& cmd.exe /c "$c 2>&1" | Out-String); $code = $LASTEXITCODE } finally { if ($savedEnc) { try { [Console]::OutputEncoding = $savedEnc } catch { } } }
+  $out = $out -replace '\x1b\[[0-9;?]*[A-Za-z]', '' -replace '[\u2500-\u257F\u23AF\u276F]+', ' '
+  $global:LASTEXITCODE = $code
+  return $out
+}
+
+# The useful part of a failed check for the chat: the failing tests and errors when it names
+# them (vitest, unittest, tsc), otherwise its last lines.
+function Check-Failure([string]$out) {
+  $lines = @($out -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  $key = @($lines | Where-Object { $_ -match '^(FAIL|ERROR|FAILED)\b|AssertionError|\berror TS\d+|^Error:|^Expected|^Received|Test Files|^Tests\s' } | Select-Object -First 10)
+  if (-not $key.Count) { $key = @($lines | Select-Object -Last 12) }
+  return (Clip ($key -join ' | ') 700)
+}
+
 function Clip([string]$s, [int]$max) { $s = ($s -replace '\s+', ' ').Trim(); if ($s.Length -gt $max) { return $s.Substring(0, $max).TrimEnd() + "…" }; return $s }
 
 # The Tyrone thread's state: its Claude Code session, and notes for its next job (subthreads that finished since).
@@ -639,8 +661,8 @@ function Run-Ship([string]$sid) {
       Push-Location -LiteralPath $wt
       $savedPath = $env:PATH; $savedVenv = $env:VIRTUAL_ENV; $savedNoColor = $env:NO_COLOR; $savedForce = $env:FORCE_COLOR
       # Plain output (no colour codes), so a failure reads cleanly in the chat.
-      try { Use-ProjectTools $wt; $env:NO_COLOR = "1"; $env:FORCE_COLOR = "0"; $out = (& cmd.exe /c "$c 2>&1" | Out-String) -replace '\x1b\[[0-9;?]*[A-Za-z]', ''; $code = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv; $env:NO_COLOR = $savedNoColor; $env:FORCE_COLOR = $savedForce; Pop-Location }
-      if ($code) { throw "$c failed on the merged code, so nothing was pushed. It's still on $branch. The end of its output: $(Clip ((@($out -split "`n" | Where-Object { $_.Trim() }) | Select-Object -Last 12) -join ' | ') 700)" }
+      try { Use-ProjectTools $wt; $env:NO_COLOR = "1"; $env:FORCE_COLOR = "0"; $out = Run-Check $c; $code = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv; $env:NO_COLOR = $savedNoColor; $env:FORCE_COLOR = $savedForce; Pop-Location }
+      if ($code) { throw "$c failed on the merged code, so nothing was pushed. It's still on $branch. What it said: $(Check-Failure $out)" }
     }
     $commit = (& git -C $wt rev-parse HEAD 2>$null | Out-String).Trim()
     $h8 = $commit.Substring(0, 8)
@@ -721,8 +743,8 @@ function Push-Live([string]$sid, [string]$wt, $g, [scriptblock]$step, [string]$d
     & $step "going" "Running $c on the result" ""
     Push-Location -LiteralPath $wt
     $savedPath = $env:PATH; $savedVenv = $env:VIRTUAL_ENV; $savedNoColor = $env:NO_COLOR; $savedForce = $env:FORCE_COLOR
-    try { Use-ProjectTools $wt; $env:NO_COLOR = "1"; $env:FORCE_COLOR = "0"; $out = (& cmd.exe /c "$c 2>&1" | Out-String) -replace '\x1b\[[0-9;?]*[A-Za-z]', ''; $code = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv; $env:NO_COLOR = $savedNoColor; $env:FORCE_COLOR = $savedForce; Pop-Location }
-    if ($code) { throw "$c failed, so nothing was pushed. The end of its output: $(Clip ((@($out -split "`n" | Where-Object { $_.Trim() }) | Select-Object -Last 12) -join ' | ') 700)" }
+    try { Use-ProjectTools $wt; $env:NO_COLOR = "1"; $env:FORCE_COLOR = "0"; $out = Run-Check $c; $code = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv; $env:NO_COLOR = $savedNoColor; $env:FORCE_COLOR = $savedForce; Pop-Location }
+    if ($code) { throw "$c failed, so nothing was pushed. What it said: $(Check-Failure $out)" }
   }
   $commit = (& git -C $wt rev-parse HEAD 2>$null | Out-String).Trim()
   $h8 = $commit.Substring(0, 8)
