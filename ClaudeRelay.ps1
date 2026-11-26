@@ -34,7 +34,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "3.1.1"
+$Version = "3.2.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -51,6 +51,10 @@ $TyroneFile = Join-Path $Folder "tyrone.json"
 # The Tyrone thread works here, outside every project: it can't change a project itself, so every change goes on a branch.
 $TyroneHome = Join-Path $Folder "tyrone"
 $MaxSubthreads = 5
+# What a subthread may run without asking (Zack, 2026-11-26): its project's checks, and committing on its own
+# branch. Never push, deploy, switch branches or delete: anything else is refused.
+$CheckCommands = @("npm run test", "npm run typecheck", "npm run lint", "npm run check", "npm test", "npx tsc", "npx vitest", "npx eslint", "npx playwright test", "node --check", "python -m pytest", "pytest", "git status", "git diff", "git log", "git show", "git add", "git commit")
+$SubthreadTools = @($CheckCommands | ForEach-Object { "Bash($($_):*)"; "PowerShell($($_):*)" })
 $JobMinutes = 45
 $null = New-Item -ItemType Directory -Force $Folder
 
@@ -259,7 +263,9 @@ function Run-Result([string]$dir) {
 function Start-Claude([string]$dir, [string]$where, [string[]]$extra, [string]$prompt) {
   [IO.File]::WriteAllText((Join-Path $dir "prompt.txt"), $prompt, (New-Object Text.UTF8Encoding($false)))
   $cliArgs = @("-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits") + $extra
-  return Start-Process -FilePath (Find-Claude) -ArgumentList $cliArgs -WorkingDirectory $where -RedirectStandardInput (Join-Path $dir "prompt.txt") -RedirectStandardOutput (Join-Path $dir "out.json") -RedirectStandardError (Join-Path $dir "err.txt") -NoNewWindow -PassThru
+  # PowerShell 5.1 joins ArgumentList with spaces and no quoting: anything with a space ("Bash(npm test:*)") is quoted here.
+  $line = ($cliArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join " "
+  return Start-Process -FilePath (Find-Claude) -ArgumentList $line -WorkingDirectory $where -RedirectStandardInput (Join-Path $dir "prompt.txt") -RedirectStandardOutput (Join-Path $dir "out.json") -RedirectStandardError (Join-Path $dir "err.txt") -NoNewWindow -PassThru
 }
 
 function Is-Running($job) { $p = Get-Process -Id ([int]$job.pid) -ErrorAction SilentlyContinue; return $p -and -not $p.HasExited -and $p.ProcessName -match "claude" }
@@ -280,7 +286,7 @@ $($t.task)
 
 How to work:
 - Every change, however small, goes to a subthread: never edit a project yourself. One subthread is right for a job in one project; a job with separate parts gets one subthread per part, and they run at the same time, up to 5 at once (more wait their turn).
-- A question you can answer from what's above (what earlier subthreads found or changed) needs no subthread: just answer it. To start one, write a file into $SpawnDir named <short-name>.json, with {"title": "a few words", "folder": "<one project name from the list>", "task": "complete instructions: the subthread knows nothing else"}. Each subthread works on its own git branch in its own copy of that project; the relay commits its changes to that branch and closes it when it's done, and nothing is merged into the main branch unless $from asks. Never start two subthreads on the same project for parts that touch the same files.
+- A question you can answer from what's above (what earlier subthreads found or changed) needs no subthread: just answer it. To start one, write a file into $SpawnDir named <short-name>.json, with {"title": "a few words", "folder": "<one project name from the list>", "task": "complete instructions: the subthread knows nothing else"}. Each subthread works on its own git branch in its own copy of that project: it runs the project's checks (typecheck, tests, lint) and commits on its branch when they pass, and the relay closes it when it's done. Nothing is merged into the main branch unless $from asks. Its result says its branch, how many commits, and how its checks went. Never start two subthreads on the same project for parts that touch the same files.
 - To stop a subthread that isn't needed any more, write $SpawnDir\stop-<its id>.json (any content).
 Running or waiting subthreads now:
 $(if ($running) { $running } else { "- none" })
@@ -383,14 +389,19 @@ function Close-Worktree($s) {
   $ErrorActionPreference = "Continue"
   if (-not $s.worktree) { return }
   $wt = [string]$s.worktree
+  $leftover = $false
   if (Test-Path -LiteralPath $wt) {
+    # Anything the subthread didn't commit itself (its checks didn't pass, or it stopped) is still kept on its branch, marked as such.
     if (@(& git -C $wt status --porcelain 2>$null).Count) {
       & git -C $wt add -A 2>$null | Out-Null
-      & git -C $wt commit -q -m "Tyrone subthread: $($s.title)" 2>$null | Out-Null
+      & git -C $wt commit -q -m "Tyrone subthread (not committed by it; checks may not pass): $($s.title)" 2>$null | Out-Null
+      $leftover = $true
     }
     & git -C ([string]$s.path) worktree remove --force $wt 2>$null | Out-Null
   }
   $ahead = [int](& git -C ([string]$s.path) rev-list --count "$($s.base)..$($s.branch)" 2>$null)
+  $s | Add-Member -Force commits $ahead
+  $s | Add-Member -Force leftover $leftover
   if ($ahead -gt 0) { $s | Add-Member -Force kept $true } else { & git -C ([string]$s.path) branch -D ([string]$s.branch) 2>$null | Out-Null; $s | Add-Member -Force kept $false }
   Save-Sub $s
 }
@@ -401,7 +412,8 @@ function Start-Sub($s) {
   $where = [string]$s.path
   if (Test-Path -LiteralPath (Join-Path $where ".git")) {
     $branch = "tyrone/" + (Slug $s.title) + "-" + $s.id.Substring(3)
-    $wt = Join-Path $WtDir $s.id
+    # Inside the project (.claude\worktrees, as the Claude app does it), so its checks find the project's installed packages by walking up.
+    $wt = Join-Path $where ".claude\worktrees\tyrone-$($s.id.Substring(3))"
     $base = (& git -C $where rev-parse HEAD 2>$null | Out-String).Trim()
     & git -C $where worktree add -q $wt -b $branch 2>$null | Out-Null
     if (-not (Test-Path -LiteralPath $wt)) { $s.state = "failed"; $s | Add-Member -Force result "Its own copy of $($s.folder) couldn't be made (git worktree), so it didn't start."; $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o")); Save-Sub $s; Add-Note "Subthread `"$($s.title)`" ($($s.folder)) failed: $($s.result)"; return }
@@ -413,9 +425,13 @@ You are a subthread of the Tyrone thread, running in the background with no one 
 
 $($s.task)
 
-Work only in this folder. Don't commit or merge: the relay commits your changes to your branch when you finish. If something you need isn't allowed or isn't clear, don't guess: stop and say what's needed. Finish with a short plain summary (a few sentences) of what you did and what changed.
+Work only in this folder.$(if ($s.branch) { @"
+
+When the change is made, run the project's checks: its typecheck and unit tests (see the scripts in package.json, or pytest), and its linter if it has one. Fix what they catch and run them again until they pass. Then commit on your branch (git add, then git commit with a short message saying what changed). Commit only when the checks pass; if they can't pass, don't commit, and say what fails and why. You may run only those checks and git status, diff, log, show, add and commit: never push, merge, switch branches, deploy or delete anything.
+"@ })
+If something you need isn't allowed or isn't clear, don't guess: stop and say what's needed. Finish with a short plain summary (a few sentences) of what you did, what changed, which checks you ran and whether they passed, and whether you committed.
 "@
-  $p = Start-Claude $dir $where @() $prompt
+  $p = Start-Claude $dir $where $(if ($s.branch) { @("--allowedTools") + $SubthreadTools } else { @() }) $prompt
   $s.state = "working"; $s | Add-Member -Force pid $p.Id; $s | Add-Member -Force startedAt ((Get-Date).ToUniversalTime().ToString("o")); Save-Sub $s
   Log "Subthread $($s.id) started in $where."
 }
@@ -432,7 +448,7 @@ function Check-Subs {
     if ($running) { Stop-Process -Id ([int]$s.pid) -Force -ErrorAction SilentlyContinue; $r = @{ ok = $false; text = "Still going after $JobMinutes minutes, so it was stopped." } } else { $r = Run-Result $dir }
     $s.state = $(if ($r.ok) { "done" } else { "failed" }); $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o"))
     Close-Worktree $s
-    $where = if ($s.branch) { if ($s.kept) { " Its changes are on the branch $($s.branch) in $($s.folder), not merged." } else { " It changed no files." } } else { "" }
+    $where = if ($s.branch) { if ($s.kept) { " Branch $($s.branch) in $($s.folder): $($s.commits) commit$(if ($s.commits -ne 1) { 's' }), not merged.$(if ($s.leftover) { ' The last one holds changes it didn''t commit itself, so its checks may not pass.' })" } else { " It changed no files." } } else { "" }
     $s | Add-Member -Force result ((Clip $r.text 2500) + $where)
     Save-Sub $s
     Add-Note "Subthread $($s.id) `"$($s.title)`" ($($s.folder)) $($s.state): $(Clip $r.text 1200)$where"
