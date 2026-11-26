@@ -14,11 +14,13 @@ Since 6.0 the listening is done by a **neural keyword engine** ([sherpa-onnx](ht
    - the 17 MB English model from sherpa-onnx's releases, checked against its published SHA-256 before it's used.
 4. Say **"hey Tyrone"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
 
-**The floating button** (since 6.1) stays on top of every window, above the clock to start with:
-- a dot and a word say how Tyrone is: green **Listening** (with a bar that moves with your voice), blue **Talking** (the assistant is open), grey **Paused**, amber **Setting up**, red **No microphone**;
-- **click it** to open the assistant, or bring it to the front if it's already open;
-- **drag it** anywhere (it remembers where);
-- **right-click it** for the same menu as the tray icon.
+**Floating Tyrone** stays on top of every window, above the clock to start with:
+- a dot and a word say how Tyrone is: green **Listening** (with a small bar that moves with your voice), blue **Talking** (the assistant is open), grey **Paused**, amber **Setting up**, red **No microphone**;
+- **Start** opens Tyrone; **Stop** ends the conversation the same way End discussion does, so it's saved (the page ends it on Escape);
+- under it, what you choose from **Show on the button**: to-dos due today, Kitchen orders, your next meeting, your last talk with Tyrone. To read those it connects to Project Check-in once with a key: make one under Settings > Datalink, then right-click > Show on the button > Connect to Project Check-in. The key is kept encrypted for your Windows account only;
+- **click** it to bring the assistant to the front, **double-click** it for the activity window, **drag** it anywhere (it remembers where), **right-click** it for the menu.
+
+The **activity window** (what it's doing, with a live mic meter) is hidden until you double-click Floating Tyrone or choose it from the menu. Closing it only hides it; the listener keeps running.
 
 It also runs as a **tray icon** by the clock. Hover it to see the microphone and the last time it opened. Right-click it (or the floating button) to:
 - show the activity window (microphone, live level meter, and each time it hears the phrase),

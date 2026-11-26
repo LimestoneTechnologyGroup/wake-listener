@@ -16,7 +16,7 @@
 
 param([switch]$Test)
 
-$Version = "6.1.0"
+$Version = "6.2.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Tyrone"   # what you'll say (two or three words work best)
@@ -258,9 +258,12 @@ function Open-Assistant {
 function Width { try { [Math]::Max(40, [Console]::WindowWidth - 1) } catch { 79 } }
 $script:meterShown = $false
 function Clear-Meter { if ($script:meterShown) { [Console]::Write("`r" + (" " * (Width)) + "`r"); $script:meterShown = $false } }
+$script:sayColors = @{ Green = @(74, 222, 128); Cyan = @(103, 232, 249); Yellow = @(250, 204, 21); Red = @(248, 113, 113); DarkGray = @(148, 163, 184); DarkYellow = @(234, 179, 8); White = @(255, 255, 255); Gray = @(226, 232, 240) }
 function Say([string]$text, [string]$color = "Gray") {
   Clear-Meter
-  Write-Host ("{0}  {1}" -f (Get-Date -Format "HH:mm:ss"), $text) -ForegroundColor $color
+  $line = "{0}  {1}" -f (Get-Date -Format "HH:mm:ss"), $text
+  Write-Host $line -ForegroundColor $color
+  if ($script:activity) { $c = $script:sayColors[$color]; if (-not $c) { $c = $script:sayColors.Gray }; $script:activity.Add($line, [System.Drawing.Color]::FromArgb($c[0], $c[1], $c[2])) }
   if ($color -eq "Yellow" -or $color -eq "Red") { Notify $text }
 }
 $script:windowLoudest = 0
@@ -274,13 +277,16 @@ function Show-Meter {
   $line = "  Mic level [" + ("#" * $bars).PadRight(30, ".") + "] " + ("{0,3}" -f $shown) + "   " + $state
   [Console]::Write("`r" + $line.PadRight((Width)).Substring(0, (Width)))
   $script:meterShown = $true
-  if (Get-Command Update-Bubble -ErrorAction SilentlyContinue) { Update-Bubble }
+  if ($script:activity -and $script:activity.Visible) { $script:activity.Meter($line.Trim()) }
+  if (Get-Command Step-Pill -ErrorAction SilentlyContinue) { Step-Pill }
 }
 
 # ---- The tray icon ----------------------------------------------------------
 # It lives next to the clock and keeps listening whatever window is in front.
 # The activity window (meter and log) starts hidden; the tray menu shows it.
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+Add-Type -Namespace WakeListenerDpi -Name Native -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+[void][WakeListenerDpi.Native]::SetProcessDPIAware()
 Add-Type -Namespace WakeListenerWindow -Name Native -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int show);
@@ -339,12 +345,11 @@ namespace WakeListenerWindows {
 function Test-AssistantOpen { try { [WakeListenerWindows.Browser]::HasWindow($AssistantTitle) } catch { $false } }
 
 $script:consoleWindow = [WakeListenerWindow.Native]::GetConsoleWindow()
-$script:windowShown = $true
+if (-not $Test) { [void][WakeListenerWindow.Native]::ShowWindow($script:consoleWindow, 0) }
+$script:windowShown = $false
 function Set-WindowShown([bool]$show) {
-  $script:windowShown = $show
-  [void][WakeListenerWindow.Native]::ShowWindow($script:consoleWindow, $(if ($show) { 9 } else { 0 }))
-  if ($show) { [void][WakeListenerWindow.Native]::SetForegroundWindow($script:consoleWindow) }
-  $script:showItem.Text = if ($show) { "Hide activity window" } else { "Show activity window" }
+  if (-not $script:activity) { return }
+  if ($show) { $script:activity.Bring() } else { $script:activity.Hide() }
 }
 $script:paused = $false
 $script:quit = $false
@@ -354,7 +359,7 @@ $script:tray = New-Object System.Windows.Forms.NotifyIcon
 $script:tray.Icon = [System.Drawing.SystemIcons]::Information
 $script:tray.Visible = $true
 $script:showItem = New-Object System.Windows.Forms.MenuItem("Show activity window")
-$script:showItem.add_Click({ Set-WindowShown (-not $script:windowShown) })
+$script:showItem.add_Click({ Set-WindowShown $true })
 $pauseItem = New-Object System.Windows.Forms.MenuItem("Pause listening")
 $pauseItem.add_Click({ $script:paused = -not $script:paused; $this.Text = if ($script:paused) { "Resume listening" } else { "Pause listening" }; Say $(if ($script:paused) { "Paused: it won't open the assistant until you resume." } else { "Resumed." }); Set-TrayText })
 # How easily it opens, remembered for next time.
@@ -396,98 +401,155 @@ function Notify([string]$text) {
 # Waits, keeping the tray menu responsive and the meter moving.
 function Idle([int]$ms) { $until = (Get-Date).AddMilliseconds($ms); while ((Get-Date) -lt $until -and -not $script:quit) { [System.Windows.Forms.Application]::DoEvents(); Show-Meter; Start-Sleep -Milliseconds 100 } }
 
+Add-Type -Path (Join-Path $PSScriptRoot "WakeUi.cs") -ReferencedAssemblies System.Windows.Forms, System.Drawing
+
+# The activity window: what the listener is doing. Hidden until you double-click
+# the floating button (or choose it from the menu); closing it only hides it.
+$script:activity = New-Object WakeUi.Activity("Wake listener " + $Version)
+
 # ---- The floating button ----------------------------------------------------
-# A small pill that stays on top of every window: a dot and a word say whether
-# Tyrone is listening, the bar under it moves with your voice. Click it to open
-# the assistant (or bring it to the front); drag it anywhere (it remembers where);
-# right-click for the same menu as the tray icon.
-$script:bubbleState = ""
-$script:bubbleColors = @{
+# Floating Tyrone (WakeUi.cs): always on top. It shows whether Tyrone is
+# listening, and Start or Stop: Start opens the assistant, Stop ends the
+# conversation the way End discussion does (so it's saved). Click it to bring
+# the assistant to the front; double-click it for the activity window; drag it
+# anywhere (it's remembered); right-click for the menu. Under it, what you
+# chose from "Show on the button": to-dos due today, Kitchen orders, the next
+# meeting, the last talk with Tyrone (read from Project Check-in with your key).
+$GlanceUrl = ($Url -replace "/assistant.*$", "") + "/api/teams/messages/intake/summary"
+$script:pillColors = @{
   listening = [System.Drawing.Color]::FromArgb(74, 222, 128); open = [System.Drawing.Color]::FromArgb(96, 165, 250)
   paused = [System.Drawing.Color]::FromArgb(148, 163, 184); setup = [System.Drawing.Color]::FromArgb(251, 191, 36)
   problem = [System.Drawing.Color]::FromArgb(248, 113, 113)
 }
-$bubble = New-Object System.Windows.Forms.Form
-$bubble.FormBorderStyle = "None"; $bubble.ShowInTaskbar = $false; $bubble.TopMost = $true
-$bubble.StartPosition = "Manual"; $bubble.Size = New-Object System.Drawing.Size(184, 46)
-$bubble.BackColor = [System.Drawing.Color]::FromArgb(14, 38, 66); $bubble.Opacity = 0.94
-$bubble.Text = "Tyrone"
-$bubble.Cursor = [System.Windows.Forms.Cursors]::Hand
-$path = New-Object System.Drawing.Drawing2D.GraphicsPath
-$r = 22; $w = $bubble.Width; $h = $bubble.Height
-$path.AddArc(0, 0, $r * 2, $h, 90, 180); $path.AddArc($w - $r * 2 - 1, 0, $r * 2, $h, 270, 180); $path.CloseFigure()
-$bubble.Region = New-Object System.Drawing.Region($path)
-$script:bubbleTitle = "Tyrone"; $script:bubbleWord = "Starting"; $script:bubbleColor = $script:bubbleColors.setup
-$titleFont = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
-$wordFont = New-Object System.Drawing.Font("Segoe UI", 8.5)
-$bubble.add_Paint({
-  param($s, $e)
-  $g = $e.Graphics; $g.SmoothingMode = "AntiAlias"
-  $dot = New-Object System.Drawing.SolidBrush($script:bubbleColor)
-  $g.FillEllipse($dot, 16, 17, 12, 12)
-  $g.DrawString($script:bubbleTitle, $titleFont, [System.Drawing.Brushes]::White, 36, 5)
-  $g.DrawString($script:bubbleWord, $wordFont, (New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(203, 213, 225))), 37, 23)
-  # The mic level, while listening.
-  if ($script:bubbleState -eq "listening") {
-    $len = [Math]::Round([Math]::Min(100, [Math]::Max(0, $script:level)) / 100 * 40)
-    $g.FillRectangle((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(51, 65, 85))), 130, 21, 40, 4)
-    if ($len -gt 0) { $g.FillRectangle($dot, 130, 21, $len, 4) }
-  }
-})
-# Drag to move; a click without a drag opens the assistant.
-$script:dragFrom = $null; $script:dragged = $false
-$bubble.add_MouseDown({ param($s, $e) if ($e.Button -eq "Left") { $script:dragFrom = $e.Location; $script:dragged = $false } })
-$bubble.add_MouseMove({
-  param($s, $e)
-  if ($script:dragFrom -and $e.Button -eq "Left") {
-    $dx = $e.X - $script:dragFrom.X; $dy = $e.Y - $script:dragFrom.Y
-    if ([Math]::Abs($dx) + [Math]::Abs($dy) -gt 3) { $script:dragged = $true }
-    if ($script:dragged) { $bubble.Location = New-Object System.Drawing.Point(($bubble.Left + $dx), ($bubble.Top + $dy)) }
-  }
-})
-$bubble.add_MouseUp({
-  param($s, $e)
-  if ($e.Button -ne "Left") { return }
-  $script:dragFrom = $null
-  if ($script:dragged) { Set-Setting "button" ("{0},{1}" -f $bubble.Left, $bubble.Top); return }
-  if (Test-AssistantOpen) { [void][WakeListenerWindows.Browser]::Focus($AssistantTitle) }
-  else { $script:openRequested = $true }
-})
-$bubble.ContextMenu = $script:tray.ContextMenu
-$tip = New-Object System.Windows.Forms.ToolTip
-# Where it was left, if that's still on a screen; otherwise bottom right, above the clock.
-$place = Get-Setting "button"
+$pill = New-Object WakeUi.Pill
+$pill.Display("Starting", $script:pillColors.setup, "", "", -1)
 $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-$at = New-Object System.Drawing.Point(($area.Right - $bubble.Width - 24), ($area.Bottom - $bubble.Height - 24))
-if ($place -match "^(-?\d+),(-?\d+)$") {
+$at = New-Object System.Drawing.Point(($area.Right - $pill.Width - 24), ($area.Bottom - $pill.Height - 24))
+$placed = Get-Setting "button"
+if ($placed -match "^(-?\d+),(-?\d+)$") {
   $p = New-Object System.Drawing.Point([int]$Matches[1], [int]$Matches[2])
   if ([System.Windows.Forms.Screen]::AllScreens | Where-Object { $_.WorkingArea.Contains($p) }) { $at = $p }
 }
-$bubble.Location = $at
+$pill.Location = $at
 
-# Puts the current state on the button: listening, talking (the assistant is open), paused, setting up, or a problem.
-function Update-Bubble {
+# What to show under it, and the key it reads your day with.
+$script:showChoices = @(@("due", "To-dos due today"), @("kitchen", "Kitchen orders"), @("next", "Next meeting"), @("last", "Last talk with Tyrone"))
+function Get-Shown { $v = Get-Setting "show"; if ($null -eq $v) { return @("due", "next") } else { return @($v.Split(",") | Where-Object { $_ }) } }
+$showItem2 = New-Object System.Windows.Forms.MenuItem("Show on the button")
+foreach ($c in $script:showChoices) {
+  $item = New-Object System.Windows.Forms.MenuItem($c[1]); $item.Tag = $c[0]; $item.Checked = ((Get-Shown) -contains $c[0])
+  $item.add_Click({
+    $this.Checked = -not $this.Checked
+    Set-Setting "show" ((@($showItem2.MenuItems | Where-Object { $_.Checked -and $_.Tag } | ForEach-Object { $_.Tag })) -join ",")
+    $script:glanceAt = [datetime]::MinValue
+  })
+  [void]$showItem2.MenuItems.Add($item)
+}
+[void]$showItem2.MenuItems.Add("-")
+$connectItem = New-Object System.Windows.Forms.MenuItem("Connect to Project Check-in...")
+$connectItem.add_Click({ $script:connectRequested = $true })
+[void]$showItem2.MenuItems.Add($connectItem)
+function Get-Key {
+  $sealed = Get-Setting "key"
+  if (-not $sealed) { return $null }
+  try { $s = ConvertTo-SecureString $sealed; return [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)) } catch { return $null }
+}
+function Connect-App {
+  Add-Type -AssemblyName Microsoft.VisualBasic
+  $key = [Microsoft.VisualBasic.Interaction]::InputBox("Paste a key from Project Check-in: Settings > Datalink > Make a key (name it Wake listener). It's kept encrypted for your Windows account only.", "Connect to Project Check-in", "")
+  if (-not $key) { return }
+  $key = $key.Trim()
+  if ($key -notmatch "^pci_[A-Za-z0-9_-]{20,100}$") { [void][System.Windows.Forms.MessageBox]::Show("That isn't a Project Check-in key: they start with pci_. Make one under Settings > Datalink.", "Connect to Project Check-in"); return }
+  # Saved sealed with Windows' data protection (DPAPI): only this Windows account can read it back.
+  Set-Setting "key" (ConvertFrom-SecureString (ConvertTo-SecureString $key -AsPlainText -Force))
+  $script:glanceAt = [datetime]::MinValue
+  Say "Connected to Project Check-in: the button shows your day." Green
+}
+
+# Your day, read every two minutes in the background (the page never waits on it).
+$script:glance = $null; $script:glanceAt = [datetime]::MinValue; $script:glanceTask = $null; $script:glanceProblem = ""
+function Step-Glance {
+  $shown = Get-Shown
+  if (-not $shown.Count) { $script:glance = $null; return }
+  $t = $script:glanceTask
+  if ($t -and $t.IsCompleted) {
+    $script:glanceTask = $null
+    if ($t.Status -eq "RanToCompletion") { try { $script:glance = $t.Result | ConvertFrom-Json; $script:glanceProblem = "" } catch { $script:glanceProblem = "couldn't read your day" } }
+    else {
+      $why = $t.Exception.InnerException
+      $script:glanceProblem = if ("$why" -match "401") { "the key was refused: connect again" } else { "Project Check-in didn't answer" }
+    }
+    $t.Dispose()
+  }
+  if ($script:glanceTask -or ((Get-Date) - $script:glanceAt).TotalSeconds -lt 120) { return }
+  $key = Get-Key
+  if (-not $key) { $script:glanceProblem = "right-click > Show on the button > Connect"; return }
+  $script:glanceAt = Get-Date
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  $web = New-Object System.Net.WebClient
+  $web.Headers["Authorization"] = "Bearer $key"; $web.Headers["User-Agent"] = "WakeListener"; $web.Encoding = [Text.Encoding]::UTF8
+  $script:glanceTask = $web.DownloadStringTaskAsync($GlanceUrl)
+}
+function Get-GlanceLine {
+  $shown = Get-Shown
+  if (-not $shown.Count) { return "" }
+  if (-not $script:glance) { return $script:glanceProblem }
+  $g = $script:glance; $parts = @()
+  if ($shown -contains "due") { $parts += $(if ($g.dueToday) { "$($g.dueToday) due today" + $(if ($g.overdue) { " ($($g.overdue) late)" } else { "" }) } else { "Nothing due today" }) }
+  if ($shown -contains "kitchen") { $parts += "Kitchen $($g.kitchen)" }
+  if ($shown -contains "next") { if ($g.nextMeeting) { $parts += ("Next: " + $g.nextMeeting.subject + " " + ([datetime]$g.nextMeeting.start).ToString("h:mm tt")) } }
+  if ($shown -contains "last") { if ($g.lastTalk) { $parts += ("Last talk " + ([datetime]$g.lastTalk.at).ToString("ddd h:mm tt")) } }
+  return ($parts -join " · ")
+}
+
+# Puts the current state on the button.
+function Update-Pill {
   $state, $word = if ($script:setupNeeded) { "setup", "Setting up" }
-    elseif ($script:assistantOpen) { "open", "Talking: click to show" }
+    elseif ($script:assistantOpen) { "open", "Talking" }
     elseif ($script:paused) { "paused", "Paused" }
     elseif (-not $script:micName) { "problem", "No microphone" }
     elseif (-not $script:ears) { "setup", "Starting" }
     else { "listening", "Listening" }
-  if ($state -ne $script:bubbleState -or $word -ne $script:bubbleWord) {
-    $script:bubbleState = $state; $script:bubbleWord = $word; $script:bubbleColor = $script:bubbleColors[$state]
-    $tip.SetToolTip($bubble, ($script:tray.Text + "`nClick: open Tyrone. Right-click: options. Drag to move."))
+  $action = if ($script:setupNeeded) { "" } elseif ($script:assistantOpen) { "Stop" } else { "Start" }
+  $lvl = if ($state -eq "listening") { [int]([Math]::Round([Math]::Min(100, [Math]::Max(0, $script:level)) / 10) * 10) } else { -1 }
+  if ($pill.Visible) { $pill.Display($word, $script:pillColors[$state], (Get-GlanceLine), $action, $lvl) }
+}
+# What was done with it.
+function Step-Pill {
+  Step-Glance
+  $click = $null
+  while ($pill.Clicks.TryDequeue([ref]$click)) {
+    switch -Wildcard ($click) {
+      "start" { $script:openRequested = $true }
+      "stop" { $script:stopRequested = $true }
+      "front" { if (Test-AssistantOpen) { [void][WakeListenerWindows.Browser]::Focus($AssistantTitle) } }
+      "activity" { Set-WindowShown $true }
+      "menu" { $script:tray.ContextMenu.Show($pill, $pill.PointToClient([System.Windows.Forms.Cursor]::Position)) }
+      "moved|*" { Set-Setting "button" $click.Substring(6) }
+    }
   }
-  if ($bubble.Visible) { $bubble.Invalidate() }
+  if ($script:connectRequested) { $script:connectRequested = $false; Connect-App }
+  Update-Pill
 }
-function Set-BubbleShown([bool]$show) {
-  $script:bubbleItem.Text = if ($show) { "Hide floating button" } else { "Show floating button" }
+# Stop: the assistant's page ends the conversation on Escape, exactly as End discussion does.
+function Stop-Assistant {
+  if (-not (Test-AssistantOpen)) { return }
+  if ([WakeListenerWindows.Browser]::Focus($AssistantTitle)) {
+    Start-Sleep -Milliseconds 250
+    [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
+    Say "Ending the conversation (the floating button)." Cyan
+  } else { Say "Couldn't reach the assistant's window to end the conversation: use End discussion there." Yellow }
+}
+function Set-PillShown([bool]$show) {
+  $script:pillItem.Text = if ($show) { "Hide floating button" } else { "Show floating button" }
   Set-Setting "button-shown" $(if ($show) { "yes" } else { "no" })
-  if ($show) { $bubble.Show() } else { $bubble.Hide() }
+  if ($show) { $pill.Show(); Update-Pill } else { $pill.Hide() }
 }
-$script:bubbleItem = New-Object System.Windows.Forms.MenuItem("Hide floating button")
-$script:bubbleItem.add_Click({ Set-BubbleShown (-not $bubble.Visible) })
-$script:tray.ContextMenu.MenuItems.Add(1, $script:bubbleItem)
-if ((Get-Setting "button-shown") -ne "no") { $bubble.Show() } else { $script:bubbleItem.Text = "Show floating button" }
+$script:pillItem = New-Object System.Windows.Forms.MenuItem("Hide floating button")
+$script:pillItem.add_Click({ Set-PillShown (-not $pill.Visible) })
+$script:tray.ContextMenu.MenuItems.Add(1, $script:pillItem) | Out-Null
+$script:tray.ContextMenu.MenuItems.Add(3, $showItem2) | Out-Null
+if ((Get-Setting "button-shown") -ne "no") { $pill.Show() } else { $script:pillItem.Text = "Show floating button" }
 
 # ---- Setting up the engine (first run, or after an update) ------------------
 # A Python of our own (a virtual environment in $EngineFolder) with the engine's
@@ -637,17 +699,13 @@ Clear-Host
 Write-Host "Wake listener $Version" -ForegroundColor White
 Write-Host "Say `"$Phrase`" and your assistant opens. A neural keyword engine listens, on this PC only."
 Write-Host "Opens: $Url"
-Write-Host "This window hides itself: the tray icon by the clock keeps listening, whatever window is in front."
-Write-Host "The floating button shows whether Tyrone is listening: click it to open him, drag it anywhere, right-click for options."
-Write-Host "Right-click the tray icon to show this window again, pause, change the sensitivity, or quit."
-Write-Host "(If you click inside this window it pauses until you press Esc.)"
+Say "Floating Tyrone shows whether he's listening. Start opens him, Stop ends the conversation; double-click it for this window, drag it anywhere, right-click for options." White
+Say "Closing this window only hides it: the listener keeps running. Quit from the menu." White
 Write-Host ""
 Set-TrayText
 $needSetup = -not (Test-Engine)
 if (-not $needSetup) {
   Say ("Sensitivity: " + $Sensitivity + ". Engine ready in " + $EngineFolder) DarkGray
-  Idle 2500
-  Set-WindowShown $false
   $script:tray.ShowBalloonTip(6000, "Wake listener is on", "Say `"$Phrase`" and your assistant opens. It's listening in the tray; right-click the icon for options.", [System.Windows.Forms.ToolTipIcon]::Info)
 }
 
@@ -667,6 +725,7 @@ $nextWindowCheck = Get-Date
 
 while (-not $script:quit) {
   $script:setupNeeded = $needSetup; $script:assistantOpen = $handedOver
+  if ($script:stopRequested) { $script:stopRequested = $false; Stop-Assistant }
   # The floating button was clicked: open the assistant now.
   if ($script:openRequested) {
     $script:openRequested = $false
@@ -811,6 +870,6 @@ while (-not $script:quit) {
 
 # Quit from the tray: tidy up.
 Stop-Listening
-$bubble.Close()
+$pill.Close(); $script:activity.Dispose()
 $script:tray.Visible = $false
 $script:tray.Dispose()
