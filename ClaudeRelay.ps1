@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Ship = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "3.3.1"
+$Version = "3.4.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -65,6 +65,8 @@ $JobMinutes = 45
 # deploy branch, and deployed, by the relay itself: subthreads still can't push. Other projects stay on their branch.
 # host/deploy/status are left out for a project that deploys on push. CLAUDE_RELAY_GOLIVE (a JSON file) is for testing.
 $GoLive = @{
+  # officepet deploys itself when main is pushed (GitHub Actions: tests, build, deploy to 865Apps).
+  "officepet" = @{ branch = "main"; checks = @("python -m unittest discover -s tests") }
   "project-checkin" = @{ branch = "dev"; checks = @("npm run typecheck", "npm test"); host = "zack@162.35.15.207"; deploy = "sudo -n ltg-dev-deploy run project-checkin"; status = "sudo -n ltg-dev-deploy status project-checkin"; app = "project-checkin" }
 }
 if ($env:CLAUDE_RELAY_GOLIVE) { $GoLive = @{}; foreach ($p in (Get-Content $env:CLAUDE_RELAY_GOLIVE -Raw | ConvertFrom-Json).PSObject.Properties) { $GoLive[$p.Name.ToLower()] = @{ branch = $p.Value.branch; checks = @($p.Value.checks); host = $p.Value.host; deploy = $p.Value.deploy; status = $p.Value.status; app = $p.Value.app } } }
@@ -273,24 +275,29 @@ function Run-Result([string]$dir) {
   return @{ ok = -not $out.is_error; text = $text; session = [string]$out.session_id }
 }
 
+# The project's own tools first on the PATH (its .venv's Python, its node_modules\.bin), found by walking up from
+# where it runs (a worktree sits inside its project), so "python -m unittest" or "npm test" runs as it does for them.
+# The caller saves and restores $env:PATH and $env:VIRTUAL_ENV.
+function Use-ProjectTools([string]$where) {
+  $first = @(); $at = $where; $venvSet = $false
+  while ($at) {
+    $venv = Join-Path $at ".venv"
+    if (-not $venvSet -and (Test-Path (Join-Path $venv "Scripts\python.exe"))) { $first += (Join-Path $venv "Scripts"); $env:VIRTUAL_ENV = $venv; $venvSet = $true }
+    $bin = Join-Path $at "node_modules\.bin"
+    if ((Test-Path $bin) -and -not ($first -contains $bin)) { $first += $bin }
+    $up = Split-Path $at -Parent; if (-not $up -or $up -eq $at) { break }; $at = $up
+  }
+  if ($first.Count) { $env:PATH = (($first | Select-Object -Unique) -join ";") + ";" + $env:PATH }
+}
+
 function Start-Claude([string]$dir, [string]$where, [string[]]$extra, [string]$prompt) {
   [IO.File]::WriteAllText((Join-Path $dir "prompt.txt"), $prompt, (New-Object Text.UTF8Encoding($false)))
   $cliArgs = @("-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits") + $extra
   # PowerShell 5.1 joins ArgumentList with spaces and no quoting: anything with a space ("Bash(npm test:*)") is quoted here.
   $line = ($cliArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join " "
-  # The project's own tools first on the PATH (its .venv's Python, its node_modules\.bin), found by walking up from
-  # where it runs (a worktree sits inside its project), so "python -m unittest" or "npm test" runs as it does for them.
   $savedPath = $env:PATH; $savedVenv = $env:VIRTUAL_ENV
   try {
-    $first = @(); $at = $where
-    while ($at -and $first.Count -lt 2) {
-      $venv = Join-Path $at ".venv"
-      if (-not $env:VIRTUAL_ENV -and (Test-Path (Join-Path $venv "Scripts\python.exe"))) { $first += (Join-Path $venv "Scripts"); $env:VIRTUAL_ENV = $venv }
-      $bin = Join-Path $at "node_modules\.bin"
-      if ((Test-Path $bin) -and -not ($first -contains $bin)) { $first += $bin }
-      $up = Split-Path $at -Parent; if (-not $up -or $up -eq $at) { break }; $at = $up
-    }
-    if ($first.Count) { $env:PATH = (($first | Select-Object -Unique) -join ";") + ";" + $savedPath }
+    Use-ProjectTools $where
     return Start-Process -FilePath (Find-Claude) -ArgumentList $line -WorkingDirectory $where -RedirectStandardInput (Join-Path $dir "prompt.txt") -RedirectStandardOutput (Join-Path $dir "out.json") -RedirectStandardError (Join-Path $dir "err.txt") -NoNewWindow -PassThru
   } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv }
 }
@@ -539,13 +546,15 @@ function Run-Ship([string]$sid) {
     foreach ($c in @($g.checks | Where-Object { $_ })) {
       Ship-Step $sid "going" "Running $c on the merged code"
       Push-Location -LiteralPath $wt
-      try { $out = (& cmd.exe /c "$c 2>&1" | Out-String); $code = $LASTEXITCODE } finally { Pop-Location }
+      $savedPath = $env:PATH; $savedVenv = $env:VIRTUAL_ENV
+      try { Use-ProjectTools $wt; $out = (& cmd.exe /c "$c 2>&1" | Out-String); $code = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv; Pop-Location }
       if ($code) { throw "$c failed on the merged code, so nothing was pushed. It's still on $branch. The end of its output: $(Clip ((@($out -split "`n" | Where-Object { $_.Trim() }) | Select-Object -Last 12) -join ' | ') 700)" }
     }
     $commit = (& git -C $wt rev-parse HEAD 2>$null | Out-String).Trim()
     $h8 = $commit.Substring(0, 8)
     Ship-Step $sid "going" "Pushing $h8 to main and $($g.branch)" $commit
-    $out = (& git -C $wt push -q origin "HEAD:refs/heads/main" "HEAD:refs/heads/$($g.branch)" 2>&1 | Out-String)
+    $refs = @("HEAD:refs/heads/main") + $(if ($g.branch -and $g.branch -ne "main") { @("HEAD:refs/heads/$($g.branch)") } else { @() })
+    $out = (& git -C $wt push -q origin @refs 2>&1 | Out-String)
     if ($LASTEXITCODE) { throw "GitHub refused the push (someone may have pushed at the same moment), so it isn't live. It's still on $branch. $(Clip $out 300)" }
     if (-not $g.host) { Ship-Step $sid "live" "Pushed $h8 to main and $($g.branch)." $commit; return }
     Ship-Step $sid "going" "Deploying $h8 to $($g.branch)"
