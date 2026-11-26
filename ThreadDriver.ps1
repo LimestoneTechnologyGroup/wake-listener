@@ -23,7 +23,7 @@
 param([switch]$Doctor, [switch]$List, [string]$Type, [string]$Message, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "1.2.0"
+$Version = "1.2.1"
 $Folder = Join-Path $env:LOCALAPPDATA "ThreadDriver"
 $RelayKey = Join-Path $env:LOCALAPPDATA "ClaudeRelay\key.txt"
 $LogFile = Join-Path $Folder "driver.log"
@@ -294,6 +294,9 @@ if ($Install) {
   $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$self`" -Base `"$Base`""
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+  # A copy already running (an older version) is stopped, so the new one takes over.
+  if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }
+  Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'ThreadDriver\.ps1' -and $_.ProcessId -ne $PID } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Types Tyrone's messages into your Claude Code threads (Project Check-in). $self" -Force | Out-Null
   Start-ScheduledTask -TaskName $TaskName
   Log "Installed: starts at sign-in, running now."
