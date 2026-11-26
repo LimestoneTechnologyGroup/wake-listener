@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "4.0.0"
+$Version = "4.0.1"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -787,7 +787,15 @@ function Live-Body {
     if ($j -and (Is-Running $j)) { $st = Read-Stream $d.FullName; $job = @{ id = $d.Name; task = (Clip ([string]$j.task) 300); startedAt = ([DateTime]::Parse([string]$j.started)).ToUniversalTime().ToString("o"); steps = @($st.steps | Select-Object -Last 10) } }
   }
   $day = (Get-Date).ToUniversalTime().AddHours(-24)
-  $subs = @(Get-Subthreads | Where-Object { @("queued", "working", "asking", "parked") -contains [string]$_.state -or ($_.finishedAt -and [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime() -gt $day) -or (Test-Path -LiteralPath (Ship-File $_.id "ship.pid")) -and -not (Test-Path -LiteralPath (Ship-File $_.id "ship.told")) -or ((Test-Path -LiteralPath (Ship-File $_.id "undo.json")) -and (Get-Item -LiteralPath (Ship-File $_.id "undo.json")).LastWriteTimeUtc -gt $day) } | ForEach-Object {
+  # Grouped explicitly: in PowerShell -and and -or bind equally, left to right, so without the brackets a finished
+  # subthread whose going live was noted (ship.told) was left out, and the app never heard it went live (4.0.1).
+  $subs = @(Get-Subthreads | Where-Object {
+    $active = @("queued", "working", "asking", "parked") -contains [string]$_.state
+    $recent = [bool]($_.finishedAt -and [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime() -gt $day)
+    $shipping = (Test-Path -LiteralPath (Ship-File $_.id "ship.pid")) -and -not (Test-Path -LiteralPath (Ship-File $_.id "ship.told"))
+    $undoing = (Test-Path -LiteralPath (Ship-File $_.id "undo.json")) -and ((Get-Item -LiteralPath (Ship-File $_.id "undo.json")).LastWriteTimeUtc -gt $day)
+    $active -or $recent -or $shipping -or $undoing
+  } | ForEach-Object {
     $st = if ($_.state -eq "working") { Read-Stream (Join-Path $SubDir $_.id) } else { $null }
     $o = [ordered]@{ id = $_.id; title = $_.title; folder = $_.folder; state = $_.state }
     foreach ($k in "queuedAt", "startedAt", "finishedAt", "branch", "result", "list", "item", "question") { if ($_.$k) { $o[$k] = [string]$_.$k } }
