@@ -1,43 +1,77 @@
 ﻿# Wake listener: say "hey Tyrone" and your Project Check-in assistant opens.
 #
-# Plain PowerShell, no exe. It learns YOUR voice saying the phrase: the first
-# time it runs it asks you to say "hey Tyrone" a few times, then compares
-# everything the microphone hears with those recordings (VoiceMatch.cs, next to
-# this file). No speech recognizer, nothing sent anywhere; the recordings stay in
-# %APPDATA%\WakeListener\voice. When it hears the phrase, it opens the
-# assistant's voice page, which starts talking.
+# Plain PowerShell, no exe. The listening is done by listen.py (next to this
+# file) with sherpa-onnx keyword spotting: a small neural model trained on
+# thousands of hours of speech, so it hears the phrase from across the room and
+# over music, in anyone's voice, with nothing to train. It runs on this PC;
+# nothing is sent anywhere. The first run sets it up (Python, the engine and its
+# 17 MB model, in %LOCALAPPDATA%\WakeListener). When it hears the phrase it opens
+# the assistant's voice page, which starts talking.
 #
 # The window shows what's going on: which microphone, a live level meter, and
-# every bit of talking it hears with how close it was to your phrase.
+# each time it hears the phrase.
 #
 # Run it: double-click "Start wake listener.cmd". Quit from the tray icon.
 # Check it without a microphone: WakeListener.ps1 -Test
 
 param([switch]$Test)
 
-$Version = "5.0.0"
+$Version = "6.0.0"
 
 # ---- Settings ---------------------------------------------------------------
-$Phrase        = "hey Tyrone"   # what you'll say (training asks you to say this)
+$Phrase        = "hey Tyrone"   # what you'll say (two or three words work best)
 $Url           = "https://project-checkin.dev.limestonetg.com/assistant?start=voice&close=1"   # close=1: the window closes itself once the conversation is saved
 $Browser       = "edge-app"     # edge-app, chrome-app, or default
-# How easily it opens. 1.0 is what training worked out from your recordings.
-# Raise it (1.1, 1.2) if it misses you; lower it (0.9) if it opens by mistake.
-$Sensitivity   = 1.0
-$VoiceFolder   = Join-Path $env:APPDATA "WakeListener\voice"
-$TrainSays     = 8              # how many times training asks for the phrase
+# How easily it opens: low, normal or high. Also on the tray icon's menu, which remembers your choice.
+$Sensitivity   = "normal"
+$EngineFolder  = Join-Path $env:LOCALAPPDATA "WakeListener"
 # While the assistant's window is open, the phrase is ignored (so it never opens
 # twice); it's found by its title. Also ignored for a few seconds after opening,
 # while the page loads and has no title yet.
 $AssistantTitle = "Assistant ·"
 $GraceSecs     = 15
+# The engine's packages, at versions tested with this release.
+$Packages      = @("sherpa-onnx==2.0.3", "sounddevice==0.5.6", "numpy==2.5.5", "sentencepiece==0.2.3")
 # -----------------------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
+$ListenPy = Join-Path $PSScriptRoot "listen.py"
+$VenvPython = Join-Path $EngineFolder "py\Scripts\python.exe"
+$SettingsFile = Join-Path $EngineFolder "settings.txt"
+try { $saved = (Get-Content $SettingsFile -ErrorAction Stop | Where-Object { $_ -match "^sensitivity=" }) -replace "^sensitivity=", ""; if ($saved -in @("low", "normal", "high")) { $Sensitivity = $saved } } catch { }
 
-Add-Type -AssemblyName System.Speech
-Add-Type -Path (Join-Path $PSScriptRoot "VoiceMatch.cs") -ReferencedAssemblies System.Speech
+# listen.py as a child process: its output lines, read in the background, one event each.
+Add-Type -Language CSharp @'
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+namespace WakeListenerEngine {
+  public class Ears {
+    public readonly ConcurrentQueue<string> Lines = new ConcurrentQueue<string>();
+    Process p;
+    public bool Running { get { try { return p != null && !p.HasExited; } catch { return false; } } }
+    public void Start(string python, string args) {
+      var info = new ProcessStartInfo(python, args) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
+      info.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+      info.EnvironmentVariables["PYTHONUNBUFFERED"] = "1";
+      p = new Process { StartInfo = info, EnableRaisingEvents = true };
+      p.OutputDataReceived += (s, e) => { if (e.Data != null) Lines.Enqueue(e.Data); };
+      p.ErrorDataReceived += (s, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) Lines.Enqueue("stderr|" + e.Data); };
+      p.Start();
+      p.BeginOutputReadLine();
+      p.BeginErrorReadLine();
+    }
+    public void Stop() {
+      var q = p; p = null;
+      if (q == null) return;
+      try { if (!q.HasExited) { q.Kill(); q.WaitForExit(3000); } } catch { }
+      q.Dispose();
+    }
+  }
+}
+'@
 
+# Windows' default recording device: its name and id, and its live level, from the Core Audio API.
 # Windows' default recording device: its name and id, and its live level, from the Core Audio API.
 Add-Type -Language CSharp @'
 using System;
@@ -121,62 +155,80 @@ function Get-Microphone {
   return [pscustomobject]@{ Id = $d.Substring(0, $i); Name = $d.Substring($i + 1) }
 }
 
-function New-ClipList { return ,(New-Object 'System.Collections.Generic.List[System.Int16[]]') }
-
 if ($Test) {
-  # Windows' own voices stand in for you: train on some "hey Tyrone"s and some
-  # ordinary talk, then check new ones open and other talk doesn't, through the
-  # same path the microphone's sound takes.
+  # Windows' own voices say the phrase and other things, with room hiss, and
+  # music under some; each recording goes through listen.py the way the
+  # microphone's sound does. The phrase must open; other talk mustn't.
+  if (-not (Test-Path $VenvPython)) { "engine: not set up in $EngineFolder; start the wake listener once to set it up"; exit 1 }
+  Add-Type -AssemblyName System.Speech
   $ok = $true
-  $voices = [WakeVoice.TestKit]::Voices()
+  $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+  $voices = @($synth.GetInstalledVoices() | Where-Object { $_.Enabled } | ForEach-Object { $_.VoiceInfo.Name })
   if (-not $voices) { "no Windows voices installed: can't run the voice checks"; exit 1 }
-  $a = $voices[0]; $b = if ($voices.Count -gt 1) { $voices[1] } else { $voices[0] }
   "voices: " + ($voices -join ", ")
-  $seed = 1
-  function Capture($text, $voice, $rate) {
-    $l = New-Object WakeVoice.Listener; $l.Training = $true
-    $null = [WakeVoice.TestKit]::Hear($l, [WakeVoice.TestKit]::Say($text, $voice, $rate, ($script:seed++)))
-    $out = @(); $c = $null; while ($l.Captured.TryDequeue([ref]$c)) { $out += ,$c }; return ,$out
-  }
-  $said = New-ClipList; $talk = New-ClipList
-  foreach ($p in @(@($a,-2),@($a,0),@($a,2),@($b,-1),@($b,1),@($a,1),@($b,0),@($b,-2))) { foreach ($c in (Capture $Phrase $p[0] $p[1])) { $said.Add($c) } }
-  foreach ($t in @("Can you send the budget numbers over to finance before lunch.", "I think the meeting moved to Thursday afternoon.", "Hey, how is the permit coming along.", "Tyrone said the trucks are running late today.", "Let's try to get the tile finished this week.", "Remind me to call the county about the inspection.")) {
-    foreach ($v in @($a, $b)) { foreach ($c in (Capture $t $v 0)) { $talk.Add($c) } }
-  }
-  "training: $($said.Count) phrase recordings, $($talk.Count) bits of ordinary talk"
-  if ($said.Count -ne 8) { "training: expected 8 phrase recordings   <-- WRONG"; $ok = $false }
-  # Saved and loaded back, as the listener does at start-up.
+  $a = $voices[0]; $b = if ($voices.Count -gt 1) { $voices[1] } else { $voices[0] }
+  $fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
   $folder = Join-Path ([IO.Path]::GetTempPath()) ("wake-listener-test-" + [guid]::NewGuid())
   $null = New-Item -ItemType Directory $folder
-  for ($i = 0; $i -lt $said.Count; $i++) { [WakeVoice.Wav]::Write((Join-Path $folder ("said_{0:00}.wav" -f $i)), $said[$i]) }
-  for ($i = 0; $i -lt $talk.Count; $i++) { [WakeVoice.Wav]::Write((Join-Path $folder ("talk_{0:00}.wav" -f $i)), $talk[$i]) }
-  $voice = [WakeVoice.Wav]::Load($folder)
-  Remove-Item -Recurse -Force $folder
-  "voice: " + $voice.Report
-  # A recording that isn't the phrase (here, other words) is left out.
-  $withBad = New-ClipList; foreach ($c in $said) { $withBad.Add($c) }
-  foreach ($c in (Capture "turn on the lights please" $a 0)) { $withBad.Add($c) }
-  $report = [WakeVoice.Voice]::Train($withBad, $talk).Report
-  "bad recording: " + $(if ($report -match "1 recording didn't sound like the others") { "left out" } else { "KEPT   <-- WRONG ($report)" })
-  if ($report -notmatch "1 recording didn't sound like the others") { $ok = $false }
-  $l = New-Object WakeVoice.Listener; $l.Voice = $voice
-  $checks = @(
-    @($Phrase, $a, -1, $true), @($Phrase, $b, 2, $true), @($Phrase, $a, 3, $true), @($Phrase, $b, -3, $true),
-    @("$Phrase, what's on my calendar today", $a, 0, $true),
-    @("Tyrone called about the permit yesterday", $a, 0, $false), @("hey how are you", $b, 0, $false),
-    @("send the budget to finance", $a, 0, $false), @("turn on the lights", $b, 0, $false),
-    @("hey there Ron", $a, 0, $false), @("hey, I don't know", $b, 0, $false), @("high tone", $a, 0, $false))
-  foreach ($t in $checks) {
-    $events = [WakeVoice.TestKit]::Hear($l, [WakeVoice.TestKit]::Say($t[0], $t[1], $t[2], ($seed++)))
-    $woke = @($events | Where-Object { $_ -like "wake|*" }).Count -gt 0
-    $best = ($events | ForEach-Object { [int]$_.Split("|")[1] } | Measure-Object -Maximum).Maximum
-    "{0,-8} {1,4}%  {2}{3}" -f $(if ($woke) { "opens" } else { "ignored" }), $best, ("`"" + $t[0] + "`" (" + $t[1].Split(" ")[1] + ", speed " + $t[2] + ")"), $(if ($woke -ne $t[3]) { "   <-- WRONG" } else { "" })
-    $ok = $ok -and ($woke -eq $t[3])
+  $rnd = New-Object System.Random 7
+  # A recording: a second of room either side, hiss throughout, and optionally a loud chord-and-drum backing.
+  function Clip([string]$text, [string]$voice, [int]$rate, [bool]$music, [string]$path) {
+    $ms = New-Object System.IO.MemoryStream
+    $synth.SelectVoice($voice); $synth.Rate = $rate
+    $synth.SetOutputToAudioStream($ms, $fmt); $synth.Speak($text); $synth.SetOutputToNull()
+    $bytes = $ms.ToArray()
+    $n = $bytes.Length / 2 + 32000
+    $out = New-Object byte[] ($n * 2)
+    $root = 110 * [Math]::Pow(2, $rnd.Next(0, 12) / 12)
+    for ($i = 0; $i -lt $n; $i++) {
+      $j = $i - 16000
+      $x = $(if ($j -ge 0 -and $j -lt $bytes.Length / 2) { [BitConverter]::ToInt16($bytes, $j * 2) * 0.6 } else { 0 }) + ($rnd.NextDouble() - 0.5) * 80
+      if ($music) {
+        if ($i % 8000 -eq 0) { $root = 110 * [Math]::Pow(2, $rnd.Next(0, 12) / 12) }
+        $t = $i / 16000.0
+        $x += 1500 * ([Math]::Sin(2 * [Math]::PI * $root * $t) + [Math]::Sin(2 * [Math]::PI * $root * 1.26 * $t) + [Math]::Sin(2 * [Math]::PI * $root * 1.5 * $t))
+      }
+      $v = [int][Math]::Max(-32768, [Math]::Min(32767, $x))
+      $out[2 * $i] = [byte]($v -band 0xFF); $out[2 * $i + 1] = [byte](($v -shr 8) -band 0xFF)
+    }
+    $w = New-Object System.IO.BinaryWriter([System.IO.File]::Create($path))
+    $w.Write([Text.Encoding]::ASCII.GetBytes("RIFF")); $w.Write([int](36 + $out.Length)); $w.Write([Text.Encoding]::ASCII.GetBytes("WAVEfmt "))
+    $w.Write([int]16); $w.Write([int16]1); $w.Write([int16]1); $w.Write([int]16000); $w.Write([int]32000); $w.Write([int16]2); $w.Write([int16]16)
+    $w.Write([Text.Encoding]::ASCII.GetBytes("data")); $w.Write([int]$out.Length); $w.Write($out); $w.Close()
   }
+  function Wakes([string]$path) {
+    $lines = & $VenvPython $ListenPy $EngineFolder $Phrase $Sensitivity --wav $path 2>&1
+    $err = $lines | Where-Object { "$_" -like "error|*" } | Select-Object -First 1
+    if ($err) { throw "listen.py: $err" }
+    return @($lines | Where-Object { "$_" -like "wake|*" }).Count
+  }
+  $checks = @(
+    @($Phrase, $a, 0, $false, $true), @($Phrase, $b, 0, $false, $true), @($Phrase, $a, 3, $false, $true), @($Phrase, $b, -3, $false, $true),
+    @($Phrase, $a, 0, $true, $true), @($Phrase, $b, 1, $true, $true),
+    @("$Phrase, what's on my calendar today", $a, 0, $false, $true),
+    @("Tyrone called about the permit yesterday", $a, 0, $false, $false), @("My brother Tyrone is coming over tonight", $b, 0, $false, $false),
+    @("hey how are you", $b, 0, $false, $false), @("send the budget to finance", $a, 0, $true, $false),
+    @("hey there Ron", $a, 0, $false, $false), @("hey Tony, grab the keys", $b, 0, $false, $false), @("high tone", $a, 0, $false, $false))
+  $n = 0
+  try {
+    foreach ($t in $checks) {
+      $path = Join-Path $folder ("clip_{0:00}.wav" -f $n++)
+      Clip $t[0] $t[1] $t[2] $t[3] $path
+      $woke = (Wakes $path) -gt 0
+      "{0,-8} `"{1}`" ({2}, speed {3}{4}){5}" -f $(if ($woke) { "opens" } else { "ignored" }), $t[0], $t[1].Split(" ")[1], $t[2], $(if ($t[3]) { ", music" } else { "" }), $(if ($woke -ne $t[4]) { "   <-- WRONG" } else { "" })
+      $ok = $ok -and ($woke -eq $t[4])
+    }
+  } catch { "voice checks: " + $_.Exception.Message + "   <-- WRONG"; $ok = $false }
+  Remove-Item -Recurse -Force $folder
   $mic = Get-Microphone
   "microphone: " + $(if ($mic) { $mic.Name } else { "none on this PC" })
-  try { $m = New-Object WakeVoice.Listener; $m.Start(); Start-Sleep -Seconds 1; $m.Stop(); "listening: opened and closed the microphone" }
-  catch { $why = $_.Exception; while ($why.InnerException) { $why = $why.InnerException }; "listening: " + $why.Message + $(if (-not $mic) { " (expected: no microphone here)" } else { "" }); if ($mic) { $ok = $false } }
+  $e = New-Object WakeListenerEngine.Ears
+  $e.Start($VenvPython, "`"$ListenPy`" `"$EngineFolder`" `"$Phrase`" $Sensitivity")
+  $until = (Get-Date).AddSeconds(15); $first = $null; $line = $null
+  while ((Get-Date) -lt $until -and -not $first) { if ($e.Lines.TryDequeue([ref]$line) -and $line -notlike "level|*") { $first = $line } else { Start-Sleep -Milliseconds 100 } }
+  $e.Stop()
+  if ($first -like "ready|*") { "listening: opened " + $first.Substring(6) }
+  else { "listening: " + $(if ($first) { $first } else { "no answer in 15 seconds" }) + $(if (-not $mic) { " (expected: no microphone here)" } else { "   <-- WRONG" }); if ($mic) { $ok = $false } }
   if ($ok) { exit 0 } else { exit 1 }
 }
 
@@ -199,13 +251,12 @@ function Say([string]$text, [string]$color = "Gray") {
   Write-Host ("{0}  {1}" -f (Get-Date -Format "HH:mm:ss"), $text) -ForegroundColor $color
   if ($color -eq "Yellow" -or $color -eq "Red") { Notify $text }
 }
-$script:listener = $null
 $script:windowLoudest = 0
 function Show-Meter {
-  # While listening: what the listener itself receives. Otherwise Windows' own meter.
-  $level = if ($script:listener) { $script:listener.TakePeak() } else { [WakeListenerAudio.DefaultMicrophone]::Level() }
+  # While listening: what the engine itself receives. Otherwise Windows' own meter.
+  $level = if ($script:ears) { $script:level } else { [WakeListenerAudio.DefaultMicrophone]::Level() }
   if ($level -gt $script:windowLoudest) { $script:windowLoudest = $level }
-  $state = if ($level -lt 0) { "no microphone" } elseif (-not $script:listener) { "not listening" } elseif ($level -ge 15) { "hearing sound" } else { "quiet" }
+  $state = if ($level -lt 0) { "no microphone" } elseif (-not $script:ears) { "not listening" } elseif ($level -ge 15) { "hearing sound" } else { "quiet" }
   $shown = [Math]::Max(0, $level)
   $bars = [Math]::Round($shown / 100 * 30)
   $line = "  Mic level [" + ("#" * $bars).PadRight(30, ".") + "] " + ("{0,3}" -f $shown) + "   " + $state
@@ -266,7 +317,8 @@ function Set-WindowShown([bool]$show) {
 }
 $script:paused = $false
 $script:quit = $false
-$script:trainRequested = $false
+$script:setupRequested = $false
+$script:sensitivityChanged = $false
 $script:tray = New-Object System.Windows.Forms.NotifyIcon
 $script:tray.Icon = [System.Drawing.SystemIcons]::Information
 $script:tray.Visible = $true
@@ -274,13 +326,29 @@ $script:showItem = New-Object System.Windows.Forms.MenuItem("Show activity windo
 $script:showItem.add_Click({ Set-WindowShown (-not $script:windowShown) })
 $pauseItem = New-Object System.Windows.Forms.MenuItem("Pause listening")
 $pauseItem.add_Click({ $script:paused = -not $script:paused; $this.Text = if ($script:paused) { "Resume listening" } else { "Pause listening" }; Say $(if ($script:paused) { "Paused: it won't open the assistant until you resume." } else { "Resumed." }); Set-TrayText })
-$trainItem = New-Object System.Windows.Forms.MenuItem("Teach it my voice again")
-$trainItem.add_Click({ $script:trainRequested = $true })
+# How easily it opens, remembered for next time.
+$sensItem = New-Object System.Windows.Forms.MenuItem("Sensitivity")
+foreach ($s in @(@("low", "Low: only when it's sure"), @("normal", "Normal"), @("high", "High: from farther away or with music"))) {
+  $item = New-Object System.Windows.Forms.MenuItem($s[1])
+  $item.Tag = $s[0]
+  $item.RadioCheck = $true
+  $item.Checked = ($s[0] -eq $Sensitivity)
+  $item.add_Click({
+    $script:Sensitivity = $this.Tag
+    foreach ($i in $sensItem.MenuItems) { $i.Checked = ($i.Tag -eq $this.Tag) }
+    try { $null = New-Item -ItemType Directory -Force $EngineFolder; Set-Content -Path $SettingsFile -Value ("sensitivity=" + $this.Tag) -Encoding ASCII } catch { }
+    Say ("Sensitivity: " + $this.Tag + ".")
+    $script:sensitivityChanged = $true
+  })
+  [void]$sensItem.MenuItems.Add($item)
+}
+$setupItem = New-Object System.Windows.Forms.MenuItem("Set up the engine again")
+$setupItem.add_Click({ $script:setupRequested = $true; $script:setupForced = $true })
 $openItem = New-Object System.Windows.Forms.MenuItem("Open the assistant now")
 $openItem.add_Click({ try { Open-Assistant } catch { } })
 $quitItem = New-Object System.Windows.Forms.MenuItem("Quit (stop listening)")
 $quitItem.add_Click({ $script:quit = $true })
-$script:tray.ContextMenu = New-Object System.Windows.Forms.ContextMenu(,[System.Windows.Forms.MenuItem[]]@($script:showItem, $pauseItem, $trainItem, $openItem, (New-Object System.Windows.Forms.MenuItem("-")), $quitItem))
+$script:tray.ContextMenu = New-Object System.Windows.Forms.ContextMenu(,[System.Windows.Forms.MenuItem[]]@($script:showItem, $pauseItem, $sensItem, $openItem, $setupItem, (New-Object System.Windows.Forms.MenuItem("-")), $quitItem))
 $script:tray.add_DoubleClick({ Set-WindowShown $true })
 $script:lastHeard = ""
 function Set-TrayText {
@@ -297,125 +365,102 @@ function Notify([string]$text) {
 # Waits, keeping the tray menu responsive and the meter moving.
 function Idle([int]$ms) { $until = (Get-Date).AddMilliseconds($ms); while ((Get-Date) -lt $until -and -not $script:quit) { [System.Windows.Forms.Application]::DoEvents(); Show-Meter; Start-Sleep -Milliseconds 100 } }
 
-# ---- Listening --------------------------------------------------------------
-$script:voice = $null
-function Start-Listening {
-  Stop-Listening
-  $l = New-Object WakeVoice.Listener
-  $l.Voice = $script:voice
-  $l.Sensitivity = $Sensitivity
-  $l.Start()
-  $script:listener = $l
-}
-function Stop-Listening {
-  $l = $script:listener; $script:listener = $null
-  if ($l) { try { $l.Stop() } catch { } }
-}
-function Why($err) { $e = $err.Exception; while ($e.InnerException) { $e = $e.InnerException }; return $e.Message }
-
-# Waits up to $secs for the next bit of talking while training; $null if none.
-function Wait-Talk($l, [int]$secs) {
-  $until = (Get-Date).AddSeconds($secs)
-  $clip = $null
-  while ((Get-Date) -lt $until -and -not $script:quit) {
-    if ($l.Captured.TryDequeue([ref]$clip)) { return ,$clip }
-    Idle 100
+# ---- Setting up the engine (first run, or after an update) ------------------
+# A Python of our own (a virtual environment in $EngineFolder) with the engine's
+# packages, and its model. Python itself comes from python.org through winget
+# when the PC has none.
+function Find-Python {
+  foreach ($v in @("3.13", "3.12", "3.14", "3.11")) {
+    try { $out = & py "-$v" -c "import sys; print(sys.executable)" 2>$null; if ($LASTEXITCODE -eq 0 -and $out) { return ($out | Select-Object -Last 1).Trim() } } catch { }
+  }
+  foreach ($c in @("python", "python3")) {
+    $cmd = Get-Command $c -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -notmatch "WindowsApps") {
+      try { $ok = & $cmd.Source -c "import sys; print(sys.version_info >= (3, 11))" 2>$null; if ($ok -eq "True") { return $cmd.Source } } catch { }
+    }
   }
   return $null
 }
-
-# Training: you say the phrase a few times, then read a few sentences out loud.
-# Returns $true when it has learned your voice.
-function Train-Voice {
-  Stop-Listening
+# Runs a program, keeping the tray responsive; its output lines go to $log. Returns its exit code.
+function Invoke-Quietly([string]$file, [string]$arguments, [scriptblock]$log) {
+  $e = New-Object WakeListenerEngine.Ears
+  $e.Start($file, $arguments)
+  $line = $null
+  while ($e.Running -or $e.Lines.Count) {
+    while ($e.Lines.TryDequeue([ref]$line)) { & $log $line }
+    [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 150
+  }
+  return 0
+}
+function Test-Engine {
+  if (-not (Test-Path $VenvPython)) { return $false }
+  $marker = Join-Path $EngineFolder "packages.txt"
+  if (-not (Test-Path $marker) -or (Get-Content $marker -Raw).Trim() -ne ($Packages -join " ")) { return $false }
+  return (Test-Path (Join-Path $EngineFolder "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01\tokens.txt"))
+}
+function Install-Engine {
+  $null = New-Item -ItemType Directory -Force $EngineFolder
   Set-WindowShown $true
-  $l = New-Object WakeVoice.Listener; $l.Training = $true
-  try { $l.Start(); $script:lastTrainError = $null } catch {
-    $why = Why $_
-    if ($why -ne $script:lastTrainError) { Say ("Couldn't open the microphone to learn your voice: " + $why + " Trying again every 20 seconds.") Red }
-    $script:lastTrainError = $why
-    return $false
-  }
-  $script:listener = $l
-  Write-Host ""
-  Say "Teaching it your voice: about a minute. Use the microphone you'll use day to day, in your normal voice." White
-  try {
-    Say "Getting the room's background level: stay quiet for two seconds." DarkGray
-    Idle 2000
-    $clip = $null; while ($l.Captured.TryDequeue([ref]$clip)) { }
-    $said = New-ClipList
-    $misses = 0
-    while ($said.Count -lt $TrainSays -and -not $script:quit) {
-      Say ("Say `"$Phrase`" now ({0} of {1}), then pause." -f ($said.Count + 1), $TrainSays) Cyan
-      $clip = Wait-Talk $l 10
-      if ($null -eq $clip) {
-        $misses++
-        if ($misses -ge 3) { Say "It isn't hearing you: check the meter moves when you talk, and the microphone isn't muted. Choose 'Teach it my voice again' from the tray icon to retry." Yellow; return $false }
-        Say "Didn't hear anything. Check the meter moves when you talk." DarkYellow
-        continue
-      }
-      $misses = 0
-      $secs = $clip.Length / 16000.0
-      if ($secs -gt 2.6) { Say ("That was {0:0.0} seconds of talking: say just `"$Phrase`" on its own, then pause." -f $secs) DarkYellow; continue }
-      if ($secs -lt 0.4) { Say "That was too short to be the phrase: try again." DarkYellow; continue }
-      $said.Add($clip)
-      Say ("Got it ({0:0.0} seconds)." -f $secs) Green
-      Idle 500
-      while ($l.Captured.TryDequeue([ref]$clip)) { }
+  Say "Setting up the listening engine (once, a few minutes; it needs the internet)." White
+  if (-not (Test-Path $VenvPython)) {
+    $python = Find-Python
+    if (-not $python) {
+      Say "Installing Python 3.12 from python.org (for this Windows account only)..." Cyan
+      $winget = Get-Command winget -ErrorAction SilentlyContinue
+      if (-not $winget) { Say "Python isn't installed and winget isn't available. Install Python 3.12 from https://www.python.org/downloads/ (tick 'Add python.exe to PATH'), then start the wake listener again." Red; return $false }
+      $p = Start-Process $winget.Source -ArgumentList "install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements" -PassThru -WindowStyle Hidden
+      while (-not $p.HasExited) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300 }
+      $python = Find-Python
+      if (-not $python) { $python = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName }
+      if (-not $python) { Say "Python didn't install. Install Python 3.12 from https://www.python.org/downloads/, then start the wake listener again." Red; return $false }
     }
-    if ($script:quit) { return $false }
-    Write-Host ""
-    Say "Now read this out loud in your normal voice, so it learns what ISN'T the phrase (about 20 seconds):" Cyan
-    Write-Host ""
-    Write-Host "    This morning I checked on the permit for the new site. Tyrone from the county" -ForegroundColor White
-    Write-Host "    says the inspection moved to Thursday, so let's get the budget over to finance" -ForegroundColor White
-    Write-Host "    before lunch. Hey, can you also call the crew about the tile and the trucks?" -ForegroundColor White
-    Write-Host "    I'd like the schedule updated by the end of the day, if that's all right." -ForegroundColor White
-    Write-Host ""
-    $talk = New-ClipList
-    $until = (Get-Date).AddSeconds(30)
-    $heardAny = $false
-    while ((Get-Date) -lt $until -and -not $script:quit) {
-      $clip = Wait-Talk $l 1
-      if ($null -ne $clip) { $talk.Add($clip); $heardAny = $true; Say ("Heard {0:0.0} seconds." -f ($clip.Length / 16000.0)) DarkGray }
-      # Done once it has a good amount and you've stopped.
-      if ($talk.Count -ge 4 -and ($talk | ForEach-Object { $_.Length } | Measure-Object -Sum).Sum -ge 16000 * 12 -and $null -eq $clip -and ((Get-Date) -gt $until.AddSeconds(-24))) {
-        $more = Wait-Talk $l 3
-        if ($null -eq $more) { break } else { $talk.Add($more) }
-      }
-    }
-    if (-not $heardAny) { Say "Didn't hear the reading; it'll learn from the phrase alone, which may open by mistake more often." DarkYellow }
-  } finally {
-    Stop-Listening
+    Say ("Using " + $python) DarkGray
+    Say "Making the wake listener's own Python environment..." Cyan
+    & $python -m venv (Join-Path $EngineFolder "py") 2>&1 | Out-Null
+    if (-not (Test-Path $VenvPython)) { Say "Couldn't make the Python environment in $EngineFolder." Red; return $false }
   }
-
-  # Keep the recordings (replacing any earlier ones) and learn from them.
-  $null = New-Item -ItemType Directory -Force $VoiceFolder
-  Get-ChildItem $VoiceFolder -Filter "*.wav" | Remove-Item -Force
-  for ($i = 0; $i -lt $said.Count; $i++) { [WakeVoice.Wav]::Write((Join-Path $VoiceFolder ("said_{0:00}.wav" -f $i)), $said[$i]) }
-  for ($i = 0; $i -lt $talk.Count; $i++) { [WakeVoice.Wav]::Write((Join-Path $VoiceFolder ("talk_{0:00}.wav" -f $i)), $talk[$i]) }
-  try { $script:voice = [WakeVoice.Voice]::Train($said, $talk) } catch { Say ("Couldn't learn from those recordings: " + (Why $_)) Red; return $false }
-  Say ("Learned your voice. " + $script:voice.Report) Green
-  Say "Try it: say `"$Phrase`" (each try shows how close it was; 100% opens)." White
+  Say "Installing the engine (sherpa-onnx and the microphone library)..." Cyan
+  $null = Invoke-Quietly $VenvPython ("-m pip install --disable-pip-version-check --no-input -q " + ($Packages -join " ")) { param($l) if ($l -notmatch "notice") { Say $l DarkGray } }
+  $check = & $VenvPython -c "import sherpa_onnx, sounddevice, numpy, sentencepiece; print('ok')" 2>$null
+  if ($check -ne "ok") { Say "The engine didn't install. Check the internet connection, then choose 'Set up the engine again' from the tray icon." Red; return $false }
+  Set-Content -Path (Join-Path $EngineFolder "packages.txt") -Value ($Packages -join " ") -Encoding ASCII
+  $failed = $false
+  $null = Invoke-Quietly $VenvPython ("`"$ListenPy`" --setup `"$EngineFolder`"") { param($l) $parts = $l.Split("|", 2); if ($parts[0] -eq "error") { $script:setupError = $parts[1]; Say ("Model: " + $parts[1]) Red } else { Say ("Model: " + $parts[-1]) DarkGray } }
+  if (-not (Test-Engine)) { Say "The speech model didn't download. Check the internet connection, then choose 'Set up the engine again' from the tray icon." Red; return $false }
+  Say "The engine is ready." Green
   return $true
 }
+
+# ---- Listening --------------------------------------------------------------
+$script:ears = $null
+$script:level = 0
+function Start-Listening {
+  Stop-Listening
+  $e = New-Object WakeListenerEngine.Ears
+  $wav = $env:WAKE_LISTENER_FAKE_MIC
+  $e.Start($VenvPython, ("`"$ListenPy`" `"$EngineFolder`" `"$Phrase`" $Sensitivity" + $(if ($wav) { " --wav `"$wav`"" } else { "" })))
+  $script:ears = $e
+  $script:earsStarted = Get-Date
+}
+function Stop-Listening {
+  $e = $script:ears; $script:ears = $null
+  if ($e) { $e.Stop() }
+}
+function Why($err) { $e = $err.Exception; while ($e.InnerException) { $e = $e.InnerException }; return $e.Message }
 
 # ---- Start ------------------------------------------------------------------
 Clear-Host
 Write-Host "Wake listener $Version" -ForegroundColor White
-Write-Host "Say `"$Phrase`" and your assistant opens. It knows your voice from your recordings."
+Write-Host "Say `"$Phrase`" and your assistant opens. A neural keyword engine listens, on this PC only."
 Write-Host "Opens: $Url"
 Write-Host "This window hides itself: the tray icon by the clock keeps listening, whatever window is in front."
-Write-Host "Right-click the tray icon to show this window again, pause, teach it your voice again, or quit."
+Write-Host "Right-click the tray icon to show this window again, pause, change the sensitivity, or quit."
 Write-Host "(If you click inside this window it pauses until you press Esc.)"
 Write-Host ""
 Set-TrayText
-try { $script:voice = [WakeVoice.Wav]::Load($VoiceFolder) } catch { Say ("Couldn't read your saved voice: " + (Why $_) + " It will ask you to record it again.") Yellow }
-$needTraining = -not $script:voice
-if ($needTraining) {
-  Say "First run: it needs to learn your voice before it can listen." White
-} else {
-  Say ("Your voice: " + $script:voice.Report) DarkGray
+$needSetup = -not (Test-Engine)
+if (-not $needSetup) {
+  Say ("Sensitivity: " + $Sensitivity + ". Engine ready in " + $EngineFolder) DarkGray
   Idle 2500
   Set-WindowShown $false
   $script:tray.ShowBalloonTip(6000, "Wake listener is on", "Say `"$Phrase`" and your assistant opens. It's listening in the tray; right-click the icon for options.", [System.Windows.Forms.ToolTipIcon]::Info)
@@ -427,7 +472,8 @@ $since = Get-Date
 $quietWarned = $false
 $nextMicCheck = Get-Date
 $restartAt = $null
-$nextTrainTry = Get-Date
+$nextSetupTry = Get-Date
+$lastLevelAt = Get-Date
 # While the assistant is open it has the microphone: the listener lets go of it,
 # and opens it afresh a couple of seconds after the assistant closes (a Bluetooth
 # headset switches modes in between).
@@ -435,11 +481,13 @@ $handedOver = $false
 $nextWindowCheck = Get-Date
 
 while (-not $script:quit) {
-  # Learning your voice: on the first run, and when asked from the tray.
-  if (($needTraining -and (Get-Date) -ge $nextTrainTry) -or $script:trainRequested) {
-    $script:trainRequested = $false
+  # Setting up the engine: on the first run, and when asked from the tray.
+  if (($needSetup -and (Get-Date) -ge $nextSetupTry) -or $script:setupRequested) {
+    $script:setupRequested = $false
     if (-not $handedOver) {
-      if (Train-Voice) { $needTraining = $false } else { $needTraining = -not $script:voice; $nextTrainTry = (Get-Date).AddSeconds(20) }
+      Stop-Listening
+      if ($script:setupForced) { Remove-Item (Join-Path $EngineFolder "packages.txt") -ErrorAction SilentlyContinue; $script:setupForced = $false }
+      if (Install-Engine) { $needSetup = $false; Say "Listening for `"$Phrase`" now." White } else { $needSetup = $true; $nextSetupTry = (Get-Date).AddMinutes(2) }
       $restartAt = Get-Date
     }
   }
@@ -460,10 +508,13 @@ while (-not $script:quit) {
       $restartAt = (Get-Date).AddSeconds(2)
     }
   }
-  if ($handedOver -or $needTraining) {
+  if ($handedOver -or $needSetup) {
     [System.Windows.Forms.Application]::DoEvents(); Show-Meter; Start-Sleep -Milliseconds 100
     continue
   }
+
+  # A new sensitivity from the tray: listen again with it.
+  if ($script:sensitivityChanged) { $script:sensitivityChanged = $false; $restartAt = Get-Date }
 
   # Every few seconds: follow the default microphone, (re)opening it whenever it changes.
   if ((Get-Date) -ge $nextMicCheck -or ($restartAt -and (Get-Date) -ge $restartAt)) {
@@ -476,20 +527,15 @@ while (-not $script:quit) {
     } else {
       $script:noMicSaid = $false
       $due = $restartAt -and (Get-Date) -ge $restartAt
-      if (-not $script:listener -or -not $mic -or $now.Id -ne $mic.Id -or $due) {
-        if ($mic -and $now.Id -ne $mic.Id) { Say "The default microphone changed. (If it's a different kind of mic, teaching it your voice again on it helps.)" }
+      if (-not $script:ears -or -not $mic -or $now.Id -ne $mic.Id -or $due) {
+        if ($mic -and $now.Id -ne $mic.Id) { Say "The default microphone changed: listening on the new one." }
         $mic = $now; $restartAt = $null
         try {
           Start-Listening
-          Say ("Listening on: " + $mic.Name) Green
-          $script:micName = $mic.Name; Set-TrayText
-          $host.UI.RawUI.WindowTitle = "Wake listener: listening on " + $mic.Name
+          $lastLevelAt = Get-Date
           $since = Get-Date; $script:windowLoudest = 0; $quietWarned = $false
-          $script:lastStartError = $null
         } catch {
-          $why = Why $_
-          if ($why -ne $script:lastStartError) { Say ("Couldn't open the microphone: " + $why + " Trying again every few seconds.") Red }
-          $script:lastStartError = $why
+          Say ("Couldn't start listening: " + (Why $_) + " Trying again in a few seconds.") Red
           Stop-Listening
           $restartAt = (Get-Date).AddSeconds(5)
         }
@@ -497,46 +543,57 @@ while (-not $script:quit) {
     }
   }
 
-  # The microphone stopped delivering sound (a Bluetooth headset switching modes, say): open it afresh.
-  if ($script:listener -and $script:listener.SecondsSinceSound -gt 3) {
-    Say "The microphone stopped sending sound: opening it again." DarkYellow
-    Stop-Listening
-    $restartAt = Get-Date
-  }
-
-  # What it heard, from the listener's queue.
-  $item = $null
-  while ($script:listener -and $script:listener.Events.TryDequeue([ref]$item)) {
-    $parts = $item.Split("|")
-    if ($parts[0] -ne "wake" -and $parts[0] -ne "heard") { continue }
-    $close = [int]$parts[1]; $secs = $parts[2]
-    $about = "$secs s of talking, $close% like your `"$Phrase`""
-    if ($parts[0] -eq "heard") {
-      if ($close -ge 85) { Say "Heard $about (opens at 100%): close. If that was you saying it, raise `$Sensitivity a little, or teach it your voice again." DarkYellow }
-      else { Say "Heard $about." DarkGray }
-    } elseif (((Get-Date) - $last).TotalSeconds -lt $GraceSecs) {
-      Say "Heard $about`: it's opening now, ignored." DarkGray
-    } elseif (Test-AssistantOpen) {
-      Say "Heard $about`: the assistant is already open, ignored." DarkGray
-    } elseif ($script:paused) {
-      Say "Heard $about`: paused, so not opening." DarkGray
-    } else {
-      Say "Heard $about`: opening the assistant." Cyan
-      $script:lastHeard = (Get-Date -Format "HH:mm") + " opened"; Set-TrayText
-      $last = Get-Date
-      # Let go of the microphone first, so the assistant gets it cleanly.
-      Stop-Listening
-      $handedOver = $true
-      Say "The assistant is open: not listening until it closes." DarkGray
-      try { Open-Assistant } catch { Say ("Couldn't open the assistant: " + $_.Exception.Message) Red }
-      break
+  # What the engine says.
+  $line = $null
+  while ($script:ears -and $script:ears.Lines.TryDequeue([ref]$line)) {
+    $parts = $line.Split("|", 2)
+    switch ($parts[0]) {
+      "level" { $script:level = [int]$parts[1]; $lastLevelAt = Get-Date }
+      "ready" {
+        Say ("Listening on: " + $parts[1]) Green
+        $script:micName = $parts[1]; Set-TrayText
+        $host.UI.RawUI.WindowTitle = "Wake listener: listening on " + $parts[1]
+        $script:lastStartError = $null
+      }
+      "stalled" { Say "The microphone stopped sending sound: opening it again." DarkYellow; Stop-Listening; $restartAt = Get-Date }
+      "error" {
+        if ($parts[1] -ne $script:lastStartError) { Say ("The listener stopped: " + $parts[1] + " Trying again in a few seconds.") Red }
+        $script:lastStartError = $parts[1]
+        Stop-Listening; $restartAt = (Get-Date).AddSeconds(5)
+      }
+      "stderr" { }
+      "wake" {
+        if (((Get-Date) - $last).TotalSeconds -lt $GraceSecs) { Say "Heard `"$Phrase`": it's opening now, ignored." DarkGray }
+        elseif (Test-AssistantOpen) { Say "Heard `"$Phrase`": the assistant is already open, ignored." DarkGray }
+        elseif ($script:paused) { Say "Heard `"$Phrase`": paused, so not opening." DarkGray }
+        else {
+          Say "Heard `"$Phrase`": opening the assistant." Cyan
+          $script:lastHeard = (Get-Date -Format "HH:mm") + " opened"; Set-TrayText
+          $last = Get-Date
+          # Let go of the microphone first, so the assistant gets it cleanly.
+          Stop-Listening
+          $handedOver = $true
+          Say "The assistant is open: not listening until it closes." DarkGray
+          try { Open-Assistant } catch { Say ("Couldn't open the assistant: " + $_.Exception.Message) Red }
+        }
+      }
     }
+    if ($handedOver) { break }
   }
   if ($handedOver) { continue }
 
+  # The engine quit without saying why, or went quiet: start it again.
+  if ($script:ears -and (-not $script:ears.Running) -and $script:ears.Lines.Count -eq 0) {
+    if ($env:WAKE_LISTENER_FAKE_MIC) { $restartAt = Get-Date } else { Say "The listener stopped: starting it again." DarkYellow; $restartAt = (Get-Date).AddSeconds(2) }
+    Stop-Listening
+  } elseif ($script:ears -and ((Get-Date) - $lastLevelAt).TotalSeconds -gt 20 -and ((Get-Date) - $script:earsStarted).TotalSeconds -gt 20) {
+    Say "The listener isn't answering: starting it again." DarkYellow
+    Stop-Listening; $restartAt = Get-Date
+  }
+
   # Silent too long: say so once (the meter should move when you talk).
-  if ($script:listener -and ((Get-Date) - $since).TotalSeconds -ge 20) {
-    if ($script:windowLoudest -lt 3 -and -not $quietWarned) { Say ("No sound at all from " + $mic.Name + " for 20 seconds: check its mute button and its input volume (Settings > System > Sound > Input).") Yellow; $quietWarned = $true }
+  if ($script:ears -and ((Get-Date) - $since).TotalSeconds -ge 20) {
+    if ($script:windowLoudest -lt 3 -and -not $quietWarned -and $script:micName) { Say ("No sound at all from " + $script:micName + " for 20 seconds: check its mute button and its input volume (Settings > System > Sound > Input).") Yellow; $quietWarned = $true }
     if ($script:windowLoudest -ge 3) { $quietWarned = $false }
     $script:windowLoudest = 0; $since = Get-Date
   }

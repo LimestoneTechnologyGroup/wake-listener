@@ -2,40 +2,45 @@
 
 Say **"hey Tyrone"** and your Project Check-in assistant opens and starts talking.
 
-It's a plain PowerShell script, not an exe. It learns **your** voice: the first time it runs, you say "hey Tyrone" eight times and read a few sentences aloud. From then on it compares everything the microphone hears with those recordings and opens the assistant when it hears the phrase, whatever window is in front. No speech recognizer and nothing sent anywhere: the recordings stay on your PC in `%APPDATA%\WakeListener\voice`.
+Since 6.0 the listening is done by a **neural keyword engine** ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) keyword spotting). It's a small model trained on thousands of hours of real speech, so it hears the phrase from across the room and over music, in anyone's voice, with nothing to train. It runs on your PC; nothing is sent anywhere.
 
 ## Install
 
-1. Download **[WakeListener.zip](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest/download/WakeListener.zip)**, right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (Updating: Quit from the tray first, then extract over the same folder. Your voice recordings are kept.)
+1. Download **[WakeListener.zip](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest/download/WakeListener.zip)**, right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (Updating: Quit from the tray first, then extract over the same folder.)
 2. Double-click **Start wake listener.cmd**. (If Windows asks about running it, choose **Run**.)
-3. **First run: teach it your voice** (about a minute), with the microphone you'll use day to day:
-   - stay quiet for two seconds while it measures the room,
-   - say "hey Tyrone" when asked, eight times, pausing after each,
-   - read the short paragraph it shows, in your normal voice.
-
-   It says how well your recordings match each other, then starts listening.
+3. **First run: it sets up the engine** (a few minutes, once, needs the internet). The activity window shows each step:
+   - Python: it uses yours (3.11 to 3.14), or installs Python 3.12 from python.org for your Windows account only, through winget;
+   - its own Python environment and the engine's packages (sherpa-onnx, sounddevice, numpy, sentencepiece), in `%LOCALAPPDATA%\WakeListener`;
+   - the 17 MB English model from sherpa-onnx's releases, checked against its published SHA-256 before it's used.
 4. Say **"hey Tyrone"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
 
-It runs as a **tray icon** by the clock. Hover it to see the microphone and the last time it opened. Right-click it to show the activity window (microphone, live level meter, and every bit of talking it hears with how close it was to your phrase: 100% opens), pause, **teach it your voice again**, open the assistant now, or quit. While the assistant is open it lets go of the microphone, and takes it back when the assistant closes.
+It runs as a **tray icon** by the clock. Hover it to see the microphone and the last time it opened. Right-click it to:
+- show the activity window (microphone, live level meter, and each time it hears the phrase),
+- pause,
+- set the **sensitivity** (low, normal, high; it remembers your choice),
+- open the assistant now,
+- set up the engine again,
+- quit.
+
+While the assistant is open it lets go of the microphone, and takes it back when the assistant closes.
 
 **Start with Windows:** press Win+R, type `shell:startup`, press Enter, and put a shortcut to **Start wake listener.cmd** in that folder.
 
 **Stop:** right-click the tray icon > Quit.
 
-## If it misses you, or opens by mistake
+## Getting the best from it
 
-- Open the activity window and watch the percentages as you talk.
-- **It misses you, and "hey Tyrone" shows 85–99%:** teach it your voice again (from the tray icon) in the place and with the mic you normally use. Or raise `$Sensitivity` at the top of `WakeListener.ps1` from 1.0 to 1.1.
-- **It opens on other talk:** lower `$Sensitivity` to 0.9.
-- **You change microphones** (say, a headset to a desk mic): teach it your voice again on the new one.
+- **Use the microphone over USB, not Bluetooth, if it has both.** While a Bluetooth headset or speakerphone has its mic on, it sends narrowband, phone-call-quality sound, which loses much of what the engine listens for. Over USB it sends full-quality sound.
+- **It misses you:** set the sensitivity to **High** from the tray icon.
+- **It opens on other talk:** set it to **Low**.
+- Say it the way you'd say "Alexa": "hey Tyrone", then a short pause.
 
 ## Settings
 
 At the top of `WakeListener.ps1` (open it in Notepad):
-- the phrase training asks for,
+- the phrase (two or three words work best),
 - the page it opens and the browser,
-- `$Sensitivity`,
-- how many recordings training takes,
+- the starting sensitivity,
 - the assistant window title it watches for.
 
 Quit from the tray and start it again after a change.
@@ -46,18 +51,18 @@ Quit from the tray and start it again after a change.
 powershell -ExecutionPolicy Bypass -File WakeListener.ps1 -Test
 ```
 
-It trains on Windows' own voices saying "hey Tyrone". It then checks that new ones open, at different speeds, and that other talk doesn't (including "Tyrone called about the permit" and "hey there Ron"), through the same path the microphone's sound takes.
+Windows' own voices say "hey Tyrone" at different speeds, some over loud music, and other things that come close ("Tyrone called about the permit", "my brother Tyrone", "hey there Ron", "hey Tony", "high tone"). Each recording goes through the engine the way the microphone's sound does: the phrase must open, the others mustn't. The engine has to be set up first, by starting the listener once.
 
 ## How it works
 
-`VoiceMatch.cs` is compiled by PowerShell when the listener starts.
-- **Cutting the sound:** it reads the default microphone and cuts the sound into bits of talking, against the room's own background level.
-- **Fingerprints:** it turns each bit into a voice fingerprint (MFCCs over 100–4000 Hz, so a Bluetooth headset works too).
-- **Matching:** it finds the best fit of your recordings inside each bit, allowing for saying it faster or slower (dynamic time warping).
-- **Where it opens:** training sets that point between how close your own recordings are to each other and how close your ordinary talk gets.
+- `WakeListener.ps1` is the tray app: it follows the default microphone, starts `listen.py`, reads what it prints, opens the assistant, and hands the microphone over while the assistant is open.
+- `listen.py` reads the microphone (sounddevice), evens out the level (slow automatic gain, so quiet or far-off talk is brought up), and runs sherpa-onnx's streaming keyword spotter on it. The phrase is turned into the model's word pieces when it starts, so another phrase works without retraining. "hi Tyrone" also counts.
+- The sensitivity sets the spotter's threshold and how strongly the phrase is favoured. "Normal" caught every test phrase, clean and over music, with no false opens over five minutes of tricky talk.
 
-Versions up to 4.x used Windows' speech recognizers instead. They were inaccurate with a headset and, in the background, stopped hearing after the first call.
+Earlier versions:
+- **5.x** compared the microphone's sound with recordings of your voice. That couldn't cope with distance, music or a Bluetooth mic.
+- **Up to 4.x** used Windows' speech recognizers. They were inaccurate with a headset and, in the background, stopped hearing after the first call.
 
 ## Why not an exe
 
-1.0.0 and 1.1.0 were a small unsigned tray exe. Windows Defender flagged a downloaded copy (`Behavior:Win32/Persistence.A!ml`, then `Trojan:Win32/Wacatac.H!ml`), as it often does with new unsigned programs that use the microphone. The script does the same job inside Windows' own signed PowerShell. The exe source (`WakeListener.cs`, `build.ps1`) is kept for when it can be code-signed.
+1.0.0 and 1.1.0 were a small unsigned tray exe. Windows Defender flagged a downloaded copy (`Behavior:Win32/Persistence.A!ml`, then `Trojan:Win32/Wacatac.H!ml`), as it often does with new unsigned programs that use the microphone. The script does the same job inside Windows' own signed PowerShell, with the engine in Python. The exe source (`WakeListener.cs`, `build.ps1`) is kept for when it can be code-signed.
