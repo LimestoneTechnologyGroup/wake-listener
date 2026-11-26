@@ -16,13 +16,14 @@
 #
 #   ThreadDriver.ps1 -Doctor                 checks it can see the Claude app and the relay's key
 #   ThreadDriver.ps1 -Type <thread id> "msg" types one message into a thread now (a test), and waits for the answer
+#   ThreadDriver.ps1 -List                   sends Tyrone the list of your threads once
 #   ThreadDriver.ps1 -Install                starts it hidden at every sign-in (a scheduled task), and now
 #   ThreadDriver.ps1 -Uninstall              stops it and removes the scheduled task
 #   ThreadDriver.ps1                         runs in this window, checking every 10 seconds
-param([switch]$Doctor, [string]$Type, [string]$Message, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
+param([switch]$Doctor, [switch]$List, [string]$Type, [string]$Message, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "1.0.0"
+$Version = "1.1.0"
 $Folder = Join-Path $env:LOCALAPPDATA "ThreadDriver"
 $RelayKey = Join-Path $env:LOCALAPPDATA "ClaudeRelay\key.txt"
 $LogFile = Join-Path $Folder "driver.log"
@@ -71,6 +72,23 @@ function Get-Session([string]$id) {
   if (-not $f) { return $null }
   return Read-Json $f.FullName
 }
+# Every thread on this PC that isn't archived (whatever its age), so Tyrone can be told to type into any of them.
+function Send-Directory([string]$key) {
+  $roots = @(Get-ChildItem -Path "$env:LOCALAPPDATA\Claude-Data\*\claude-code-sessions", "$env:APPDATA\Claude\claude-code-sessions" -Directory -ErrorAction SilentlyContinue)
+  $epoch = New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+  $threads = @()
+  foreach ($f in @($roots | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Recurse -Filter "local_*.json" -File -ErrorAction SilentlyContinue })) {
+    $s = Read-Json $f.FullName
+    if (-not $s -or $s.isArchived) { continue }
+    $title = if ($s.title) { [string]$s.title } else { continue }
+    $place = if ($s.writtenRepositories -and @($s.writtenRepositories).Count) { [string](@($s.writtenRepositories)[0]) } else { [string]$s.cwd }
+    $threads += [ordered]@{ id = $f.BaseName; title = $title; folder = $(if ($place) { Split-Path $place -Leaf } else { "" }); lastActivityAt = $(if ($s.lastActivityAt) { $epoch.AddMilliseconds([double]$s.lastActivityAt).ToString("o") } else { "" }) }
+  }
+  $w = Web $key; $w.Headers["Content-Type"] = "application/json"
+  [void]$w.UploadString("$Url/directory", "POST", (ConvertTo-Json -InputObject @{ threads = @($threads | Select-Object -First 300) } -Depth 4 -Compress))
+  return $threads.Count
+}
+
 function Is-Busy($s) { return $s.latestUserFrameAt -and $s.lastTurnEdgeAt -and ([double]$s.latestUserFrameAt -gt [double]$s.lastTurnEdgeAt) }
 # Its last answer: the newest assistant text in its conversation file, after a given time.
 function Last-Answer($s, [DateTime]$after) {
@@ -224,6 +242,13 @@ if ($Doctor) {
   exit 0
 }
 
+if ($List) {
+  $key = Get-Key
+  if (-not $key) { Write-Host "Connect the Claude relay first: ClaudeRelay.ps1 -Connect" -ForegroundColor Yellow; exit 1 }
+  Write-Host "Sent Tyrone the list of $(Send-Directory $key) threads."
+  exit 0
+}
+
 if ($Type) {
   $r = Type-Into $Type $Message
   if ($r) { Write-Host "Not typed: $($r.why)" -ForegroundColor Yellow; exit 1 }
@@ -254,9 +279,13 @@ if ($Uninstall) {
 $mutex = New-Object System.Threading.Mutex($false, "Local\ThreadDriver")
 if (-not $mutex.WaitOne(0)) { Write-Host "The Thread driver is already running." -ForegroundColor Yellow; exit 0 }
 Log "Thread driver $Version running: checking for messages every 10 seconds."
-$last = ""
+$last = ""; $nextList = Get-Date
 while ($true) {
   $key = Get-Key
+  if ($key -and (Get-Date) -ge $nextList) {
+    try { $n = Send-Directory $key; if ($n -ne $script:listed) { Log "Sent Tyrone the list of $n threads."; $script:listed = $n } } catch { Log ("Thread list not sent: " + $_.Exception.Message) }
+    $nextList = (Get-Date).AddMinutes(2)
+  }
   $note = if (-not $key) { "Not connected: run ClaudeRelay.ps1 -Connect" } else { try { Check $key; "" } catch { "Not checked: " + $_.Exception.Message } }
   if ($note -ne $last) { if ($note) { Log $note }; $last = $note }
   Start-Sleep -Seconds 10
