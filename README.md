@@ -108,3 +108,15 @@ Setup:
 
 Tested on 2026-11-26: Tyrone sent a Claude Code job through the relay to this PC.
 
+
+## Thread driver (ThreadDriver.ps1)
+
+Lets Tyrone type into your real Claude Code threads. Say "tell the project-checkin fork thread to run the tests again": Tyrone reads it back, and on your yes the Thread driver on your PC opens that thread in the Claude desktop app, types the message into its box and presses Enter, exactly as if you'd typed it. The thread works with its own settings (and shows in the app, and on your phone through Remote Control). When it finishes its turn, its answer goes back to Tyrone and your chat.
+
+It needs the Claude relay connected (it uses the relay's key) and a live screen: it waits, and Tyrone says why, while the PC is locked or Remote Desktop to it is disconnected, while the thread is busy, or while there's unsent text in that thread's box (it never overwrites it). It brings the Claude app to the front while it types. It types only after the app is really in front, checks the whole message landed before pressing Enter, and never clicks anything else: it never answers a permission prompt. When a thread stops to ask, Tyrone tells you, and you approve it yourself.
+
+1. Connect the Claude relay first (above).
+2. `powershell -ExecutionPolicy Bypass -File ThreadDriver.ps1 -Doctor` checks it can see the Claude app, its message box and the relay's key.
+3. `powershell -ExecutionPolicy Bypass -File ThreadDriver.ps1 -Install` copies it to `%LOCALAPPDATA%\ThreadDriver` and starts it hidden at every sign-in (a scheduled task named Thread driver).
+
+`-Type <thread id> "message"` types one message now and waits for the answer (a test). `-Uninstall` removes the scheduled task. Its log is `%LOCALAPPDATA%\ThreadDriver\driver.log`.
