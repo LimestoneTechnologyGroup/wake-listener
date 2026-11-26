@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Ship = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "3.4.0"
+$Version = "3.5.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -290,6 +290,27 @@ function Use-ProjectTools([string]$where) {
   if ($first.Count) { $env:PATH = (($first | Select-Object -Unique) -join ";") + ";" + $env:PATH }
 }
 
+# A worktree has the project's files but not its installed packages. Checks that name node_modules by path
+# (project-checkin's promote test runs node_modules/tsx) fail there, so the copy gets a junction to the
+# project's own node_modules, removed again before the worktree is (so removing it never touches the real one).
+function Link-Packages([string]$repo, [string]$wt) {
+  $src = Join-Path $repo "node_modules"; $dst = Join-Path $wt "node_modules"
+  if ((Test-Path -LiteralPath $src) -and -not (Test-Path -LiteralPath $dst)) { & cmd.exe /c "mklink /J `"$dst`" `"$src`"" 2>$null | Out-Null }
+}
+# Removes the junction only. True when nothing linked is left, so the worktree can be removed safely.
+function Unlink-Packages([string]$wt) {
+  $dst = Join-Path $wt "node_modules"
+  $item = Get-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue
+  if (-not $item) { return $true }
+  if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $true }
+  & cmd.exe /c "rmdir `"$dst`"" 2>$null | Out-Null
+  return -not (Test-Path -LiteralPath $dst)
+}
+function Remove-Worktree([string]$repo, [string]$wt) {
+  if (-not (Test-Path -LiteralPath $wt)) { return }
+  if (Unlink-Packages $wt) { & git -C $repo worktree remove --force $wt 2>$null | Out-Null } else { Log "Left $wt in place: its node_modules link couldn't be removed." }
+}
+
 function Start-Claude([string]$dir, [string]$where, [string[]]$extra, [string]$prompt) {
   [IO.File]::WriteAllText((Join-Path $dir "prompt.txt"), $prompt, (New-Object Text.UTF8Encoding($false)))
   $cliArgs = @("-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits") + $extra
@@ -431,7 +452,7 @@ function Close-Worktree($s) {
       & git -C $wt commit -q -m "Tyrone subthread (not committed by it; checks may not pass): $($s.title)" 2>$null | Out-Null
       $leftover = $true
     }
-    & git -C ([string]$s.path) worktree remove --force $wt 2>$null | Out-Null
+    Remove-Worktree ([string]$s.path) $wt
   }
   $ahead = [int](& git -C ([string]$s.path) rev-list --count "$($s.base)..$($s.branch)" 2>$null)
   $s | Add-Member -Force commits $ahead
@@ -451,6 +472,7 @@ function Start-Sub($s) {
     $base = (& git -C $where rev-parse HEAD 2>$null | Out-String).Trim()
     & git -C $where worktree add -q $wt -b $branch 2>$null | Out-Null
     if (-not (Test-Path -LiteralPath $wt)) { $s.state = "failed"; $s | Add-Member -Force result "Its own copy of $($s.folder) couldn't be made (git worktree), so it didn't start."; $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o")); Save-Sub $s; Add-Note "Subthread `"$($s.title)`" ($($s.folder)) failed: $($s.result)"; return }
+    Link-Packages $where $wt
     $s | Add-Member -Force worktree $wt; $s | Add-Member -Force branch $branch; $s | Add-Member -Force base $base
     $where = $wt
   }
@@ -531,9 +553,10 @@ function Run-Ship([string]$sid) {
     Ship-Step $sid "going" "Getting the latest $($s.folder) from GitHub"
     & git -C $repo fetch -q origin 2>$null | Out-Null
     if ($LASTEXITCODE) { throw "Couldn't reach GitHub (git fetch failed), so it isn't live. It's still on $branch." }
-    if (Test-Path -LiteralPath $wt) { & git -C $repo worktree remove --force $wt 2>$null | Out-Null }
+    Remove-Worktree $repo $wt
     & git -C $repo worktree add -q --detach $wt origin/main 2>$null | Out-Null
     if (-not (Test-Path -LiteralPath $wt)) { throw "Couldn't make a copy of main to merge into, so it isn't live. It's still on $branch." }
+    Link-Packages $repo $wt
     Ship-Step $sid "going" "Merging $branch into main"
     foreach ($from in @($branch, "origin/$($g.branch)")) {
       $null = (& git -C $wt merge --no-edit -m "Merge $from (Tyrone: $($s.title))" $from 2>&1 | Out-String)
@@ -546,8 +569,9 @@ function Run-Ship([string]$sid) {
     foreach ($c in @($g.checks | Where-Object { $_ })) {
       Ship-Step $sid "going" "Running $c on the merged code"
       Push-Location -LiteralPath $wt
-      $savedPath = $env:PATH; $savedVenv = $env:VIRTUAL_ENV
-      try { Use-ProjectTools $wt; $out = (& cmd.exe /c "$c 2>&1" | Out-String); $code = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv; Pop-Location }
+      $savedPath = $env:PATH; $savedVenv = $env:VIRTUAL_ENV; $savedNoColor = $env:NO_COLOR; $savedForce = $env:FORCE_COLOR
+      # Plain output (no colour codes), so a failure reads cleanly in the chat.
+      try { Use-ProjectTools $wt; $env:NO_COLOR = "1"; $env:FORCE_COLOR = "0"; $out = (& cmd.exe /c "$c 2>&1" | Out-String) -replace '\x1b\[[0-9;?]*[A-Za-z]', ''; $code = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv; $env:NO_COLOR = $savedNoColor; $env:FORCE_COLOR = $savedForce; Pop-Location }
       if ($code) { throw "$c failed on the merged code, so nothing was pushed. It's still on $branch. The end of its output: $(Clip ((@($out -split "`n" | Where-Object { $_.Trim() }) | Select-Object -Last 12) -join ' | ') 700)" }
     }
     $commit = (& git -C $wt rev-parse HEAD 2>$null | Out-String).Trim()
@@ -570,7 +594,7 @@ function Run-Ship([string]$sid) {
   } catch {
     Ship-Step $sid "failed" ([string]$_.Exception.Message)
   } finally {
-    if (Test-Path -LiteralPath $wt) { & git -C $repo worktree remove --force $wt 2>$null | Out-Null }
+    Remove-Worktree $repo $wt
   }
 }
 
