@@ -17,8 +17,9 @@ Since 6.0 the listening is done by a **neural keyword engine** ([sherpa-onnx](ht
 **Floating Tyrone** stays on top of every window, above the clock to start with:
 - a dot and a word say how Tyrone is: green **Listening** (with a small bar that moves with your voice), blue **Talking** (the assistant is open), grey **Paused**, amber **Setting up**, red **No microphone**;
 - **Start** opens Tyrone; **Stop** ends the conversation the same way End discussion does, so it's saved (the page ends it on Escape);
-- under it, what you choose from **Show on the button**: to-dos due today, Kitchen orders, your next meeting, your last talk with Tyrone. To read those it connects to Project Check-in once with a key: make one under Settings > Datalink, then right-click > Show on the button > Connect to Project Check-in. The key is kept encrypted for your Windows account only;
-- **click** it to bring the assistant to the front, **double-click** it for the activity window, **drag** it anywhere (it remembers where), **right-click** it for the menu.
+- under it, what you choose from **Show on the button**: to-dos due today, Kitchen orders, your next meeting, your last talk with Tyrone. The first time, **click the button** (or right-click > Show on the button > Connect to Project Check-in): a Project Check-in page opens, you press **Connect**, and it hands the listener a key on this PC. The key is kept encrypted for your Windows account only, and you can revoke it on the Datalink page. (Or paste a key yourself: right-click > Show on the button > Paste a key instead.);
+- **Tyrone's window hides itself** a few seconds after he starts talking, so only Floating Tyrone shows and he keeps going. **Click** the button to show his window, click again to hide it. Turn the hiding off with "Hide Tyrone's window while he talks" on the menu. (Closing his window with its X still ends the conversation: use Stop, or just leave it hidden.);
+- **double-click** it for the activity window, **drag** it anywhere (it remembers where), **right-click** it for the menu.
 
 The **activity window** (what it's doing, with a live mic meter) is hidden until you double-click Floating Tyrone or choose it from the menu. Closing it only hides it; the listener keeps running.
 

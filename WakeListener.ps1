@@ -16,7 +16,7 @@
 
 param([switch]$Test)
 
-$Version = "6.2.0"
+$Version = "6.3.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Tyrone"   # what you'll say (two or three words work best)
@@ -245,6 +245,7 @@ if ($Test) {
 }
 
 function Open-Assistant {
+  $script:openedAt = Get-Date; $script:keepShown = $false
   if ($env:WAKE_LISTENER_FAKE_MIC) { Write-Host "(test run: the assistant would open now)"; return }
   $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
   $chrome = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -323,6 +324,29 @@ namespace WakeListenerWindows {
       if (IsIconic(hit)) ShowWindow(hit, 9);
       return SetForegroundWindow(hit);
     }
+    /// <summary>The assistant's browser window (visible or hidden), or zero.</summary>
+    public static IntPtr Find(string titlePart) {
+      IntPtr hit = IntPtr.Zero;
+      EnumWindows((w, p) => {
+        var text = new StringBuilder(512);
+        GetWindowText(w, text, text.Capacity);
+        if (text.ToString().IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) < 0) return true;
+        uint pid; GetWindowThreadProcessId(w, out pid);
+        try { var name = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant(); if (name == "msedge" || name == "chrome") { hit = w; return false; } } catch { }
+        return true;
+      }, IntPtr.Zero);
+      return hit;
+    }
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
+    /// <summary>The window still exists and still has the title (the page closes it when the conversation is saved).</summary>
+    public static bool Alive(IntPtr w, string titlePart) {
+      if (w == IntPtr.Zero || !IsWindow(w)) return false;
+      var text = new StringBuilder(512); GetWindowText(w, text, text.Capacity);
+      return text.ToString().IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+    public static bool Visible(IntPtr w) { return w != IntPtr.Zero && IsWindowVisible(w); }
+    public static void Hide(IntPtr w) { if (w != IntPtr.Zero) ShowWindow(w, 0); }
+    public static bool Reveal(IntPtr w) { if (w == IntPtr.Zero) return false; ShowWindow(w, IsIconic(w) ? 9 : 5); return SetForegroundWindow(w); }
     public static bool HasWindow(string titlePart) {
       bool found = false;
       EnumWindows((w, p) => {
@@ -342,7 +366,20 @@ namespace WakeListenerWindows {
   }
 }
 '@
-function Test-AssistantOpen { try { [WakeListenerWindows.Browser]::HasWindow($AssistantTitle) } catch { $false } }
+# Open: a visible assistant window, or the one we hid (it's still there, talking).
+$script:assistantWindow = [IntPtr]::Zero
+function Test-AssistantOpen {
+  try {
+    if ([WakeListenerWindows.Browser]::Alive($script:assistantWindow, $AssistantTitle)) { return $true }
+    $script:assistantWindow = [IntPtr]::Zero
+    return [WakeListenerWindows.Browser]::HasWindow($AssistantTitle)
+  } catch { $false }
+}
+# Shows Tyrone's window (it may be hidden); false when there's none.
+function Show-Assistant {
+  $w = if ([WakeListenerWindows.Browser]::Alive($script:assistantWindow, $AssistantTitle)) { $script:assistantWindow } else { [WakeListenerWindows.Browser]::Find($AssistantTitle) }
+  return [WakeListenerWindows.Browser]::Reveal($w)
+}
 
 $script:consoleWindow = [WakeListenerWindow.Native]::GetConsoleWindow()
 if (-not $Test) { [void][WakeListenerWindow.Native]::ShowWindow($script:consoleWindow, 0) }
@@ -449,18 +486,78 @@ foreach ($c in $script:showChoices) {
 $connectItem = New-Object System.Windows.Forms.MenuItem("Connect to Project Check-in...")
 $connectItem.add_Click({ $script:connectRequested = $true })
 [void]$showItem2.MenuItems.Add($connectItem)
+$pasteItem = New-Object System.Windows.Forms.MenuItem("Paste a key instead...")
+$pasteItem.add_Click({ $script:pasteRequested = $true })
+[void]$showItem2.MenuItems.Add($pasteItem)
 function Get-Key {
   $sealed = Get-Setting "key"
   if (-not $sealed) { return $null }
   try { $s = ConvertTo-SecureString $sealed; return [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)) } catch { return $null }
 }
+# Connect: opens Project Check-in's one-click page; it posts a fresh key back to
+# this PC (http://localhost:<port>/connect) with the one-time state we sent.
+$script:linkServer = $null; $script:linkTask = $null; $script:linkState = $null; $script:linkUntil = [datetime]::MinValue
 function Connect-App {
+  Stop-LinkServer
+  $rnd = New-Object System.Random
+  $script:linkState = -join (1..32 | ForEach-Object { "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[$rnd.Next(62)] })
+  foreach ($try in 1..10) {
+    $port = $rnd.Next(49200, 64000)
+    $server = New-Object System.Net.HttpListener
+    $server.Prefixes.Add("http://localhost:$port/")
+    try { $server.Start(); $script:linkServer = $server; break } catch { $server.Close() }
+  }
+  if (-not $script:linkServer) { Say "Couldn't open a local port to receive the key: use Paste a key instead from the menu." Yellow; return }
+  $script:linkTask = $script:linkServer.GetContextAsync()
+  $script:linkUntil = (Get-Date).AddMinutes(5)
+  $page = ($Url -replace "/assistant.*$", "") + "/settings/datalink/listener?port=$port&state=" + $script:linkState
+  Say "Connecting to Project Check-in: press Connect on the page that opened (it waits five minutes)." Cyan
+  $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($Browser -eq "edge-app" -and $edge) { Start-Process $edge "--app=$page" } else { Start-Process $page }
+}
+function Stop-LinkServer {
+  if ($script:linkServer) { try { $script:linkServer.Stop(); $script:linkServer.Close() } catch { } }
+  $script:linkServer = $null; $script:linkTask = $null
+}
+# Waits for the page's post without holding anything up.
+function Step-Link {
+  if (-not $script:linkServer) { return }
+  # Connected: the page's answer goes out first, then the port closes.
+  if ($script:linkDone) { if (((Get-Date) - $script:linkDone).TotalSeconds -ge 2) { $script:linkDone = $null; Stop-LinkServer }; return }
+  if ((Get-Date) -gt $script:linkUntil) { Stop-LinkServer; Say "Connecting timed out: choose Connect to Project Check-in again." DarkYellow; return }
+  $t = $script:linkTask
+  if (-not $t -or -not $t.IsCompleted) { return }
+  $ctx = $null
+  try { $ctx = $t.Result } catch { Stop-LinkServer; return }
+  $ok = $false
+  try {
+    if ($ctx.Request.HttpMethod -eq "POST" -and $ctx.Request.Url.AbsolutePath -eq "/connect") {
+      $body = (New-Object System.IO.StreamReader($ctx.Request.InputStream, [Text.Encoding]::UTF8)).ReadToEnd()
+      $form = @{}
+      foreach ($pair in $body.Split("&")) { $kv = $pair.Split("=", 2); if ($kv.Count -eq 2) { $form[[Uri]::UnescapeDataString($kv[0].Replace("+", " "))] = [Uri]::UnescapeDataString($kv[1].Replace("+", " ")) } }
+      if ($form["state"] -eq $script:linkState -and $form["key"] -match "^pci_[A-Za-z0-9_-]{20,100}$") {
+        Set-Setting "key" (ConvertFrom-SecureString (ConvertTo-SecureString $form["key"] -AsPlainText -Force))
+        $ok = $true
+      }
+    }
+    $html = if ($ok) { "<!doctype html><meta charset=utf-8><title>Connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px;background:#0c1e36;color:#fff'><h1>Connected</h1><p>Floating Tyrone will show your day in a moment. You can close this window.</p><script>setTimeout(function(){window.close()},2500)</script>" } else { "<!doctype html><meta charset=utf-8><title>Not connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px'><h1>Not connected</h1><p>That didn't come from this connect. Choose Connect to Project Check-in from the wake listener's menu again.</p>" }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($html)
+    $ctx.Response.ContentType = "text/html; charset=utf-8"; $ctx.Response.StatusCode = $(if ($ok) { 200 } else { 400 })
+    $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length); $ctx.Response.Close()
+  } catch { }
+  if ($ok) {
+    $script:linkDone = Get-Date
+    $script:glanceAt = [datetime]::MinValue
+    Say "Connected to Project Check-in: Floating Tyrone shows your day." Green
+  } else { $script:linkTask = $script:linkServer.GetContextAsync() }
+}
+# The fallback: paste a key made on the Datalink page.
+function Paste-Key {
   Add-Type -AssemblyName Microsoft.VisualBasic
   $key = [Microsoft.VisualBasic.Interaction]::InputBox("Paste a key from Project Check-in: Settings > Datalink > Make a key (name it Wake listener). It's kept encrypted for your Windows account only.", "Connect to Project Check-in", "")
   if (-not $key) { return }
   $key = $key.Trim()
   if ($key -notmatch "^pci_[A-Za-z0-9_-]{20,100}$") { [void][System.Windows.Forms.MessageBox]::Show("That isn't a Project Check-in key: they start with pci_. Make one under Settings > Datalink.", "Connect to Project Check-in"); return }
-  # Saved sealed with Windows' data protection (DPAPI): only this Windows account can read it back.
   Set-Setting "key" (ConvertFrom-SecureString (ConvertTo-SecureString $key -AsPlainText -Force))
   $script:glanceAt = [datetime]::MinValue
   Say "Connected to Project Check-in: the button shows your day." Green
@@ -483,7 +580,7 @@ function Step-Glance {
   }
   if ($script:glanceTask -or ((Get-Date) - $script:glanceAt).TotalSeconds -lt 120) { return }
   $key = Get-Key
-  if (-not $key) { $script:glanceProblem = "right-click > Show on the button > Connect"; return }
+  if (-not $key) { $script:glanceProblem = "Click here to show your day"; return }
   $script:glanceAt = Get-Date
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   $web = New-Object System.Net.WebClient
@@ -522,19 +619,48 @@ function Step-Pill {
     switch -Wildcard ($click) {
       "start" { $script:openRequested = $true }
       "stop" { $script:stopRequested = $true }
-      "front" { if (Test-AssistantOpen) { [void][WakeListenerWindows.Browser]::Focus($AssistantTitle) } }
+      "front" {
+        if (Test-AssistantOpen) {
+          $w = [WakeListenerWindows.Browser]::Find($AssistantTitle)
+          if ([WakeListenerWindows.Browser]::Visible($w)) { $script:assistantWindow = $w; [WakeListenerWindows.Browser]::Hide($w); $script:keepShown = $false }
+          else { [void](Show-Assistant); $script:keepShown = $true }
+        } elseif (-not (Get-Key)) { $script:connectRequested = $true }
+      }
       "activity" { Set-WindowShown $true }
       "menu" { $script:tray.ContextMenu.Show($pill, $pill.PointToClient([System.Windows.Forms.Cursor]::Position)) }
       "moved|*" { Set-Setting "button" $click.Substring(6) }
     }
   }
   if ($script:connectRequested) { $script:connectRequested = $false; Connect-App }
+  if ($script:pasteRequested) { $script:pasteRequested = $false; Paste-Key }
+  Step-Link
+  Step-Hide
   Update-Pill
 }
+# Tyrone's window hides itself a few seconds after it opens (once the voice has
+# started), so only Floating Tyrone shows; he keeps talking. Click the button to
+# show it again. "Show Tyrone's window" on the menu turns the hiding off.
+$script:openedAt = $null; $script:keepShown = $false
+function Step-Hide {
+  if (-not $script:openedAt) { return }
+  if ((Get-Setting "hide-window") -eq "no" -or $script:keepShown) { $script:openedAt = $null; return }
+  if (((Get-Date) - $script:openedAt).TotalSeconds -lt 6) { return }
+  $w = [WakeListenerWindows.Browser]::Find($AssistantTitle)
+  if ($w -ne [IntPtr]::Zero) {
+    $script:assistantWindow = $w
+    [WakeListenerWindows.Browser]::Hide($w)
+    $script:openedAt = $null
+    Say "Tyrone's window is hidden while he talks: click Floating Tyrone to show it." DarkGray
+  } elseif (((Get-Date) - $script:openedAt).TotalSeconds -gt 60) { $script:openedAt = $null }
+}
+$hideItem = New-Object System.Windows.Forms.MenuItem("Hide Tyrone's window while he talks")
+$hideItem.Checked = ((Get-Setting "hide-window") -ne "no")
+$hideItem.add_Click({ $this.Checked = -not $this.Checked; Set-Setting "hide-window" $(if ($this.Checked) { "yes" } else { "no" }) })
+
 # Stop: the assistant's page ends the conversation on Escape, exactly as End discussion does.
 function Stop-Assistant {
   if (-not (Test-AssistantOpen)) { return }
-  if ([WakeListenerWindows.Browser]::Focus($AssistantTitle)) {
+  if (Show-Assistant) {
     Start-Sleep -Milliseconds 250
     [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
     Say "Ending the conversation (the floating button)." Cyan
@@ -549,6 +675,7 @@ $script:pillItem = New-Object System.Windows.Forms.MenuItem("Hide floating butto
 $script:pillItem.add_Click({ Set-PillShown (-not $pill.Visible) })
 $script:tray.ContextMenu.MenuItems.Add(1, $script:pillItem) | Out-Null
 $script:tray.ContextMenu.MenuItems.Add(3, $showItem2) | Out-Null
+$script:tray.ContextMenu.MenuItems.Add(4, $hideItem) | Out-Null
 if ((Get-Setting "button-shown") -ne "no") { $pill.Show() } else { $script:pillItem.Text = "Show floating button" }
 
 # ---- Setting up the engine (first run, or after an update) ------------------
@@ -870,6 +997,7 @@ while (-not $script:quit) {
 
 # Quit from the tray: tidy up.
 Stop-Listening
+Stop-LinkServer
 $pill.Close(); $script:activity.Dispose()
 $script:tray.Visible = $false
 $script:tray.Dispose()
