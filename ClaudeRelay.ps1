@@ -13,10 +13,14 @@
 #    projects, and only dispatches: every change, however small, goes to a
 #    subthread (up to 5 run at once), each in its own git worktree of one
 #    project, on its own branch (tyrone/...), committed by the relay when it
-#    finishes and then closed. Nothing ever lands on the branch you work on,
-#    and nothing is merged into a main branch. File edits are allowed; any
-#    command your project hasn't allowed is refused. Results go back to Tyrone
-#    and your chat. Claude Code here needs signing in once: see -Doctor.
+#    finishes and then closed. Nothing ever lands on the branch you work on.
+#    File edits are allowed; any command your project hasn't allowed is
+#    refused. Results go back to Tyrone and your chat. Claude Code here needs
+#    signing in once: see -Doctor.
+#    Going live (3.3.0): when a subthread's checks pass in a project with
+#    go-live steps below ($GoLive), the relay itself (not Claude) merges its
+#    branch into main, runs the checks again on the merged code, pushes main
+#    and dev, and deploys, posting each step to your Tyrone chat and Talk.
 # 3. While anything runs, every few seconds it sends what the Tyrone thread and
 #    each subthread are doing, step by step (reading a file, editing one,
 #    running the tests), so Talk shows it live.
@@ -31,10 +35,10 @@
 #
 # The key is kept encrypted for your Windows account (DPAPI) in
 # %LOCALAPPDATA%\ClaudeRelay. Revoke it on Project Check-in's Datalink page.
-param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
+param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Ship = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "3.2.0"
+$Version = "3.3.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -56,6 +60,15 @@ $MaxSubthreads = 5
 $CheckCommands = @("npm run test", "npm run typecheck", "npm run lint", "npm run check", "npm test", "npx tsc", "npx vitest", "npx eslint", "npx playwright test", "node --check", "python -m pytest", "pytest", "git status", "git diff", "git log", "git show", "git add", "git commit")
 $SubthreadTools = @($CheckCommands | ForEach-Object { "Bash($($_):*)"; "PowerShell($($_):*)" })
 $JobMinutes = 45
+# Going live (Zack, 2026-11-26: "push all the way to dev, if I can see it in the chat"). A subthread that committed
+# with its checks passing, in one of these projects, is merged into main, checked again, pushed to main and the
+# deploy branch, and deployed, by the relay itself: subthreads still can't push. Other projects stay on their branch.
+# host/deploy/status are left out for a project that deploys on push. CLAUDE_RELAY_GOLIVE (a JSON file) is for testing.
+$GoLive = @{
+  "project-checkin" = @{ branch = "dev"; checks = @("npm run typecheck", "npm test"); host = "zack@162.35.15.207"; deploy = "sudo -n ltg-dev-deploy run project-checkin"; status = "sudo -n ltg-dev-deploy status project-checkin"; app = "project-checkin" }
+}
+if ($env:CLAUDE_RELAY_GOLIVE) { $GoLive = @{}; foreach ($p in (Get-Content $env:CLAUDE_RELAY_GOLIVE -Raw | ConvertFrom-Json).PSObject.Properties) { $GoLive[$p.Name.ToLower()] = @{ branch = $p.Value.branch; checks = @($p.Value.checks); host = $p.Value.host; deploy = $p.Value.deploy; status = $p.Value.status; app = $p.Value.app } } }
+$GoLiveMinutes = 20
 $null = New-Item -ItemType Directory -Force $Folder
 
 function Log([string]$text) {
@@ -286,7 +299,7 @@ $($t.task)
 
 How to work:
 - Every change, however small, goes to a subthread: never edit a project yourself. One subthread is right for a job in one project; a job with separate parts gets one subthread per part, and they run at the same time, up to 5 at once (more wait their turn).
-- A question you can answer from what's above (what earlier subthreads found or changed) needs no subthread: just answer it. To start one, write a file into $SpawnDir named <short-name>.json, with {"title": "a few words", "folder": "<one project name from the list>", "task": "complete instructions: the subthread knows nothing else"}. Each subthread works on its own git branch in its own copy of that project: it runs the project's checks (typecheck, tests, lint) and commits on its branch when they pass, and the relay closes it when it's done. Nothing is merged into the main branch unless $from asks. Its result says its branch, how many commits, and how its checks went. Never start two subthreads on the same project for parts that touch the same files.
+- A question you can answer from what's above (what earlier subthreads found or changed) needs no subthread: just answer it. To start one, write a file into $SpawnDir named <short-name>.json, with {"title": "a few words", "folder": "<one project name from the list>", "task": "complete instructions: the subthread knows nothing else"}. Each subthread works on its own git branch in its own copy of that project: it runs the project's checks (typecheck, tests, lint) and commits on its branch when they pass, and the relay closes it when it's done. In $(($GoLive.Keys | Sort-Object) -join ', ') the relay then puts it live by itself (merges it into main, checks it again, pushes and deploys to dev) and tells $from in the chat; in other projects it stays on its branch. Its result says its branch, how many commits, how its checks went, and whether it's going live. Never start two subthreads on the same project for parts that touch the same files.
 - To stop a subthread that isn't needed any more, write $SpawnDir\stop-<its id>.json (any content).
 Running or waiting subthreads now:
 $(if ($running) { $running } else { "- none" })
@@ -448,12 +461,18 @@ function Check-Subs {
     if ($running) { Stop-Process -Id ([int]$s.pid) -Force -ErrorAction SilentlyContinue; $r = @{ ok = $false; text = "Still going after $JobMinutes minutes, so it was stopped." } } else { $r = Run-Result $dir }
     $s.state = $(if ($r.ok) { "done" } else { "failed" }); $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o"))
     Close-Worktree $s
-    $where = if ($s.branch) { if ($s.kept) { " Branch $($s.branch) in $($s.folder): $($s.commits) commit$(if ($s.commits -ne 1) { 's' }), not merged.$(if ($s.leftover) { ' The last one holds changes it didn''t commit itself, so its checks may not pass.' })" } else { " It changed no files." } } else { "" }
+    $where = if ($s.branch) { if ($s.kept) { " Branch $($s.branch) in $($s.folder): $($s.commits) commit$(if ($s.commits -ne 1) { 's' }).$(if ($s.leftover) { ' The last one holds changes it didn''t commit itself, so its checks may not pass, and it won''t go live.' })" } else { " It changed no files." } } else { "" }
+    if ($s.state -eq "done" -and $s.kept -and -not $s.leftover) {
+      $g = $GoLive[([string]$s.folder).ToLower()]
+      if ($g) { Write-Json (Join-Path $dir "ship.json") ([pscustomobject]@{ state = "waiting"; steps = @(); detail = "Waiting to go live" }); $where += " Going live on $($g.branch) next: the relay merges it into main, runs the checks again, pushes and deploys." }
+      else { $where += " $($s.folder) has no go-live steps set up, so it stays on its branch." }
+    }
     $s | Add-Member -Force result ((Clip $r.text 2500) + $where)
     Save-Sub $s
     Add-Note "Subthread $($s.id) `"$($s.title)`" ($($s.folder)) $($s.state): $(Clip $r.text 1200)$where"
     Log "Subthread $($s.id) $($s.state)."
   }
+  Check-Ships
   # Waiting ones start as places free up; a project with no git gets one subthread at a time.
   $working = @(Get-Subthreads | Where-Object { $_.state -eq "working" })
   foreach ($s in @(Get-Subthreads | Where-Object { $_.state -eq "queued" } | Sort-Object { [string]$_.queuedAt })) {
@@ -467,6 +486,95 @@ function Check-Subs {
   foreach ($s in @(Get-Subthreads | Where-Object { $_.finishedAt -and ((Get-Date).ToUniversalTime() - [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime()).TotalDays -gt 7 })) { Remove-Item -Recurse -Force (Join-Path $SubDir $s.id) -ErrorAction SilentlyContinue }
 }
 
+# ---- Going live: run by the relay, one project at a time, in its own hidden PowerShell (-Ship <id>) ----
+function Ship-File([string]$sid, [string]$name) { return Join-Path (Join-Path $SubDir $sid) $name }
+function Ship-Step([string]$sid, [string]$state, [string]$text, [string]$commit = "") {
+  $file = Ship-File $sid "ship.json"
+  $g = Read-Json $file; if (-not $g) { $g = [pscustomobject]@{ state = $state; steps = @() } }
+  $g.state = $state
+  if ($text) { $g.steps = @(@($g.steps) + @([pscustomobject]@{ at = (Get-Date).ToUniversalTime().ToString("o"); text = (Clip $text 200) }) | Select-Object -Last 10); $g | Add-Member -Force detail (Clip $text 1500) }
+  if ($commit) { $g | Add-Member -Force commit $commit }
+  Write-Json $file $g
+  Log "Going live, ${sid}: $(Clip $text 300)"
+}
+
+function Run-Ship([string]$sid) {
+  $ErrorActionPreference = "Continue"
+  $s = Read-Json (Ship-File $sid "sub.json")
+  if (-not $s) { return }
+  $g = $GoLive[([string]$s.folder).ToLower()]
+  if (-not $g) { Ship-Step $sid "failed" "$($s.folder) has no go-live steps."; return }
+  $repo = [string]$s.path; $branch = [string]$s.branch
+  $wt = Join-Path $repo ".claude\worktrees\tyrone-live-$($sid.Substring(3))"
+  try {
+    Ship-Step $sid "going" "Getting the latest $($s.folder) from GitHub"
+    & git -C $repo fetch -q origin 2>$null | Out-Null
+    if ($LASTEXITCODE) { throw "Couldn't reach GitHub (git fetch failed), so it isn't live. It's still on $branch." }
+    if (Test-Path -LiteralPath $wt) { & git -C $repo worktree remove --force $wt 2>$null | Out-Null }
+    & git -C $repo worktree add -q --detach $wt origin/main 2>$null | Out-Null
+    if (-not (Test-Path -LiteralPath $wt)) { throw "Couldn't make a copy of main to merge into, so it isn't live. It's still on $branch." }
+    Ship-Step $sid "going" "Merging $branch into main"
+    foreach ($from in @($branch, "origin/$($g.branch)")) {
+      $null = (& git -C $wt merge --no-edit -m "Merge $from (Tyrone: $($s.title))" $from 2>&1 | Out-String)
+      if ($LASTEXITCODE) {
+        $files = @(& git -C $wt diff --name-only --diff-filter=U 2>$null) -join ", "
+        & git -C $wt merge --abort 2>$null | Out-Null
+        throw "It clashes with newer changes on $(if ($from -eq $branch) { 'main' } else { $g.branch })$(if ($files) { " in $files" }), so it wasn't merged or pushed. It's still on $branch."
+      }
+    }
+    foreach ($c in @($g.checks | Where-Object { $_ })) {
+      Ship-Step $sid "going" "Running $c on the merged code"
+      Push-Location -LiteralPath $wt
+      try { $out = (& cmd.exe /c "$c 2>&1" | Out-String); $code = $LASTEXITCODE } finally { Pop-Location }
+      if ($code) { throw "$c failed on the merged code, so nothing was pushed. It's still on $branch. The end of its output: $(Clip ((@($out -split "`n" | Where-Object { $_.Trim() }) | Select-Object -Last 12) -join ' | ') 700)" }
+    }
+    $commit = (& git -C $wt rev-parse HEAD 2>$null | Out-String).Trim()
+    $h8 = $commit.Substring(0, 8)
+    Ship-Step $sid "going" "Pushing $h8 to main and $($g.branch)" $commit
+    $out = (& git -C $wt push -q origin "HEAD:refs/heads/main" "HEAD:refs/heads/$($g.branch)" 2>&1 | Out-String)
+    if ($LASTEXITCODE) { throw "GitHub refused the push (someone may have pushed at the same moment), so it isn't live. It's still on $branch. $(Clip $out 300)" }
+    if (-not $g.host) { Ship-Step $sid "live" "Pushed $h8 to main and $($g.branch)." $commit; return }
+    Ship-Step $sid "going" "Deploying $h8 to $($g.branch)"
+    $out = (& ssh -o BatchMode=yes -o ConnectTimeout=15 $g.host $g.deploy 2>&1 | Out-String)
+    if ($LASTEXITCODE) { throw "It's pushed to main and $($g.branch) ($h8), but the deploy couldn't start: $(Clip $out 300)" }
+    $until = (Get-Date).AddMinutes($GoLiveMinutes)
+    while ((Get-Date) -lt $until) {
+      $st = (& ssh -o BatchMode=yes -o ConnectTimeout=15 $g.host $g.status 2>&1 | Out-String)
+      if (@($st -split "`n" | Where-Object { $_ -match "^\s*$([regex]::Escape($g.app))\s" -and $_ -match "$h8 live" }).Count) { Ship-Step $sid "live" "Live on $($g.branch): $h8." $commit; return }
+      Start-Sleep -Seconds 20
+    }
+    Ship-Step $sid "failed" "Pushed $h8 to main and $($g.branch) and started the deploy, but it didn't show as live within $GoLiveMinutes minutes. Check ltg-dev-deploy status." $commit
+  } catch {
+    Ship-Step $sid "failed" ([string]$_.Exception.Message)
+  } finally {
+    if (Test-Path -LiteralPath $wt) { & git -C $repo worktree remove --force $wt 2>$null | Out-Null }
+  }
+}
+
+# Starts waiting ones (one per project at a time), notices one that died, and tells the Tyrone thread how each ended.
+function Check-Ships {
+  $all = @(Get-Subthreads)
+  foreach ($s in $all) {
+    $g = Read-Json (Ship-File $s.id "ship.json")
+    if (-not $g) { continue }
+    $pidFile = Ship-File $s.id "ship.pid"
+    $alive = $false
+    if (Test-Path -LiteralPath $pidFile) { $p = Get-Process -Id ([int](Get-Content -LiteralPath $pidFile -Raw)) -ErrorAction SilentlyContinue; $alive = $p -and -not $p.HasExited -and $p.ProcessName -match "powershell" }
+    if (($g.state -eq "going" -or $g.state -eq "waiting") -and (Test-Path -LiteralPath $pidFile) -and -not $alive) { Ship-Step $s.id "failed" "The go-live step stopped partway (the PC may have restarted). It's still on $($s.branch)."; $g = Read-Json (Ship-File $s.id "ship.json") }
+    if ($g.state -eq "waiting" -and -not (Test-Path -LiteralPath $pidFile)) {
+      $busy = @($all | Where-Object { $_.id -ne $s.id -and $_.path -eq $s.path -and (Test-Path -LiteralPath (Ship-File $_.id "ship.pid")) -and @("waiting", "going") -contains [string](Read-Json (Ship-File $_.id "ship.json")).state }).Count
+      if ($busy) { continue }
+      $p = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Ship $($s.id)" -WindowStyle Hidden -PassThru
+      Set-Content -LiteralPath $pidFile -Value $p.Id
+      Log "Subthread $($s.id) going live."
+    }
+    if (($g.state -eq "live" -or $g.state -eq "failed") -and -not (Test-Path -LiteralPath (Ship-File $s.id "ship.told"))) {
+      Add-Note "Subthread $($s.id) `"$($s.title)`" ($($s.folder)) $(if ($g.state -eq 'live') { 'went live' } else { "didn't go live" }): $($g.detail)"
+      Set-Content -LiteralPath (Ship-File $s.id "ship.told") -Value $g.state
+    }
+  }
+}
+
 # ---- Live: what the Tyrone thread and its subthreads are doing, step by step, for Talk ----
 function Live-Body {
   $job = $null
@@ -476,11 +584,13 @@ function Live-Body {
     if ($j -and (Is-Running $j)) { $st = Read-Stream $d.FullName; $job = @{ id = $d.Name; task = (Clip ([string]$j.task) 300); startedAt = ([DateTime]::Parse([string]$j.started)).ToUniversalTime().ToString("o"); steps = @($st.steps | Select-Object -Last 10) } }
   }
   $day = (Get-Date).ToUniversalTime().AddHours(-24)
-  $subs = @(Get-Subthreads | Where-Object { $_.state -eq "queued" -or $_.state -eq "working" -or ($_.finishedAt -and [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime() -gt $day) } | ForEach-Object {
+  $subs = @(Get-Subthreads | Where-Object { $_.state -eq "queued" -or $_.state -eq "working" -or ($_.finishedAt -and [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime() -gt $day) -or (Test-Path -LiteralPath (Ship-File $_.id "ship.pid")) -and -not (Test-Path -LiteralPath (Ship-File $_.id "ship.told")) } | ForEach-Object {
     $st = if ($_.state -eq "working") { Read-Stream (Join-Path $SubDir $_.id) } else { $null }
     $o = [ordered]@{ id = $_.id; title = $_.title; folder = $_.folder; state = $_.state }
     foreach ($k in "queuedAt", "startedAt", "finishedAt", "branch", "result") { if ($_.$k) { $o[$k] = [string]$_.$k } }
     if ($st) { $o.steps = @($st.steps | Select-Object -Last 6) }
+    $g = Read-Json (Ship-File $_.id "ship.json")
+    if ($g) { $o.ship = [ordered]@{ state = [string]$g.state; detail = [string]$g.detail; steps = @($g.steps | Select-Object -Last 6) }; if ($g.commit) { $o.ship.commit = [string]$g.commit } }
     $o
   })
   return @{ tyrone = @{ version = $Version; state = $(if ($job) { "working" } else { "idle" }); job = $job; subthreads = $subs; max = $MaxSubthreads } }
@@ -496,7 +606,7 @@ function Send-Live([string]$key) {
   $script:LastLive = $body; $script:LastLiveAt = Get-Date
 }
 
-function Busy { return [bool]((@(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { -not (Test-Path (Join-Path $_.FullName "done.txt")) -and (Test-Path (Join-Path $_.FullName "job.json")) }).Count) -or @(Get-Subthreads | Where-Object { $_.state -eq "working" -or $_.state -eq "queued" }).Count) }
+function Busy { return [bool]((@(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { -not (Test-Path (Join-Path $_.FullName "done.txt")) -and (Test-Path (Join-Path $_.FullName "job.json")) }).Count) -or @(Get-Subthreads | Where-Object { $_.state -eq "working" -or $_.state -eq "queued" -or @("waiting", "going") -contains [string](Read-Json (Ship-File $_.id "ship.json")).state }).Count) }
 
 function Poll-Jobs([string]$key) {
   $null = New-Item -ItemType Directory -Force $JobsDir, $SubDir, $WtDir, $SpawnDir
@@ -602,6 +712,9 @@ if ($Doctor) {
 }
 
 if ($DryRun) { ConvertTo-Json -InputObject @{ threads = @(Get-Threads); folders = @((Get-JobFolders).Values | ForEach-Object { $_.name } | Sort-Object) } -Depth 4; exit 0 }
+
+# -Ship <subthread id>: the relay starts this, hidden, to put one finished subthread live.
+if ($Ship) { Run-Ship $Ship; exit 0 }
 
 $key = Get-Key
 if (-not $key) { Write-Host "Not connected yet: run ClaudeRelay.ps1 -Connect" -ForegroundColor Yellow; exit 1 }
