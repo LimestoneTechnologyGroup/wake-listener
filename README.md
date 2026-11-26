@@ -85,12 +85,22 @@ Earlier versions:
 
 ## Claude relay (ClaudeRelay.ps1)
 
-Tells Tyrone what's going on in your Claude Code threads. Run it on the PC where the Claude desktop app runs your threads, which may not be the PC with the wake listener (for example a desktop you reach over Remote Desktop).
+Connects Tyrone to your Claude Code threads. Run it on the PC where the Claude desktop app runs your threads, which may not be the PC with the wake listener (for example a desktop you reach over Remote Desktop). Download: the `relay-v…` release (ClaudeRelay.zip), not the wake listener's.
 
-Every two minutes it reads the desktop app's session files on that PC and sends Project Check-in the list: each thread's name, folder, whether it's working, waiting on you or done, its last report and what it needs from you. Read only: it sends nothing to the threads.
+**What's going on.** Every two minutes it reads the desktop app's session files on that PC and sends Project Check-in the list: each thread's name, folder, whether it's working, waiting on you or done, its last report and what it needs from you.
+
+**Jobs (2.0).** Every 20 seconds it picks up the Claude Code jobs you asked Tyrone to send ("tell the project-checkin thread to make the Ask button focus the box", "have Claude Code fix the recorder in wired"). Tyrone reads each job back and sends it only after you say yes. On the PC:
+
+- It runs only in your project folders: a folder where a Claude Code thread has run in the last 30 days (never the app's scratch or temp folders, or a folder that holds other projects). `-Doctor` lists them.
+- A job for a thread picks up from a copy of that thread's conversation (`--resume … --fork-session`), so the thread itself is untouched; otherwise it starts fresh in the folder.
+- It runs in the background with this PC's Claude Code (the copy the desktop app keeps), with file edits allowed and any command your project hasn't already allowed refused (`--permission-mode acceptEdits`); the result says what was skipped. At most two at once, 45 minutes each. Cancelling the job on Project Check-in stops it.
+- The result (Claude Code's own summary) goes back to Tyrone, into your Tyrone chat, and by phone if you asked for a call back.
+
+Setup:
 
 1. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Connect`, then press **Connect Claude relay** on the page that opens. The key is kept encrypted for your Windows account in `%LOCALAPPDATA%\ClaudeRelay`.
-2. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Install` copies it to `%LOCALAPPDATA%\ClaudeRelay` and starts it hidden at every sign-in (a scheduled task named Claude relay).
+2. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Doctor`. The desktop app signs in only its own threads, so the first time it shows one command to sign Claude Code in for jobs (`claude.exe auth login`, which opens your browser). Run that once yourself.
+3. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Install` copies it to `%LOCALAPPDATA%\ClaudeRelay` and starts it hidden at every sign-in (a scheduled task named Claude relay). Run it again after downloading a new version.
 
-`-DryRun` shows what it would send; `-Once` sends once; `-Uninstall` removes the scheduled task. Its log is `%LOCALAPPDATA%\ClaudeRelay\relay.log`. Revoke the key on Project Check-in's Datalink page.
+`-DryRun` shows what it would send; `-Once` sends the thread list once; `-Uninstall` removes the scheduled task. Its log is `%LOCALAPPDATA%\ClaudeRelayelay.log`, and each job's prompt and output are kept for a week in `%LOCALAPPDATA%\ClaudeRelay\jobs`. Revoke the key on Project Check-in's Datalink page.
 
