@@ -35,10 +35,10 @@
 #
 # The key is kept encrypted for your Windows account (DPAPI) in
 # %LOCALAPPDATA%\ClaudeRelay. Revoke it on Project Check-in's Datalink page.
-param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Ship = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
+param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "3.5.0"
+$Version = "4.0.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -71,6 +71,9 @@ $GoLive = @{
 }
 if ($env:CLAUDE_RELAY_GOLIVE) { $GoLive = @{}; foreach ($p in (Get-Content $env:CLAUDE_RELAY_GOLIVE -Raw | ConvertFrom-Json).PSObject.Properties) { $GoLive[$p.Name.ToLower()] = @{ branch = $p.Value.branch; checks = @($p.Value.checks); host = $p.Value.host; deploy = $p.Value.deploy; status = $p.Value.status; app = $p.Value.app } } }
 $GoLiveMinutes = 20
+# Tyrone building himself (4.0): a build waiting on an answer keeps its copy for this long, then is parked on its branch.
+$AskHours = 24
+$BuildFolder = "project-checkin"
 $null = New-Item -ItemType Directory -Force $Folder
 
 function Log([string]$text) {
@@ -465,6 +468,7 @@ function Start-Sub($s) {
   $ErrorActionPreference = "Continue"
   $dir = Join-Path $SubDir $s.id
   $where = [string]$s.path
+  if ($s.resume) { Resume-Sub $s; return }
   if (Test-Path -LiteralPath (Join-Path $where ".git")) {
     $branch = "tyrone/" + (Slug $s.title) + "-" + $s.id.Substring(3)
     # Inside the project (.claude\worktrees, as the Claude app does it), so its checks find the project's installed packages by walking up.
@@ -485,11 +489,63 @@ Work only in this folder.$(if ($s.branch) { @"
 
 When the change is made, run the project's checks: its typecheck and unit tests (see the scripts in package.json, or pytest), and its linter if it has one. Fix what they catch and run them again until they pass. Then commit on your branch (git add, then git commit with a short message saying what changed). Commit only when the checks pass; if they can't pass, don't commit, and say what fails and why. You may run only those checks and git status, diff, log, show, add and commit: never push, merge, switch branches, deploy or delete anything.
 "@ })
-If something you need isn't allowed or isn't clear, don't guess: stop and say what's needed. Finish with a short plain summary (a few sentences) of what you did, what changed, which checks you ran and whether they passed, and whether you committed.
+$(if ($s.build) { Ask-Rule $s })If something you need isn't allowed or isn't clear, don't guess: stop and say what's needed. Finish with a short plain summary (a few sentences) of what you did, what changed, which checks you ran and whether they passed, and whether you committed.
 "@
+  if ($s.build) { $prompt = "This is Tyrone's own app: $($s.folder) is the app Tyrone, $(Who $s)'s assistant, runs in, and this change is Tyrone building something into himself that $(Who $s) agreed to. Read the project's CLAUDE.md first and follow it.`n`n" + $prompt }
   $p = Start-Claude $dir $where $(if ($s.branch) { @("--allowedTools") + $SubthreadTools } else { @() }) $prompt
   $s.state = "working"; $s | Add-Member -Force pid $p.Id; $s | Add-Member -Force startedAt ((Get-Date).ToUniversalTime().ToString("o")); Save-Sub $s
   Log "Subthread $($s.id) started in $where."
+}
+
+function Who($s) { if ($s.from) { return [string]$s.from } else { return "the person" } }
+function Ask-Rule($s) {
+  return @"
+If you reach a decision you can't reasonably make yourself (something $(Who $s) would want a say in: wording, where it goes, which of two behaviours), don't guess and don't commit: stop, and end your final message with exactly these two lines:
+QUESTION: <one short question for $(Who $s)>
+OPTIONS: <first option> | <second option>
+(two or three short options). Your work so far is kept, and you'll be picked up again with the answer. Ask only when it really matters; settle small things yourself, the way the code around it already does them.
+
+"@
+}
+
+# A build that stopped on a question, picked up again with the answer: the same Claude Code session, in the same copy
+# (made again from its branch if it was parked).
+function Resume-Sub($s) {
+  $ErrorActionPreference = "Continue"
+  $dir = Join-Path $SubDir $s.id
+  $repo = [string]$s.path; $wt = Join-Path $repo ".claude\worktrees\tyrone-$($s.id.Substring(3))"
+  if (-not (Test-Path -LiteralPath $wt)) {
+    & git -C $repo worktree add -q $wt ([string]$s.branch) 2>$null | Out-Null
+    # Parked before it changed anything, its empty branch was dropped: start it again from where it began.
+    if (-not (Test-Path -LiteralPath $wt)) { & git -C $repo worktree add -q $wt -b ([string]$s.branch) ([string]$s.base) 2>$null | Out-Null }
+    if (-not (Test-Path -LiteralPath $wt)) { $s.state = "failed"; $s | Add-Member -Force result "Its copy couldn't be made again from $($s.branch), so it couldn't carry on."; $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o")); $s.resume = $false; Save-Sub $s; return }
+    Link-Packages $repo $wt
+    $s | Add-Member -Force worktree $wt
+  }
+  # The last run's output stays for reference; the new run writes its own.
+  foreach ($f in "out.json", "err.txt") { $old = Join-Path $dir $f; if (Test-Path -LiteralPath $old) { Move-Item -LiteralPath $old (Join-Path $dir ("before-" + (Get-Date -Format "HHmmss") + "-" + $f)) -Force } }
+  $script:Streams.Remove($dir)
+  $prompt = @"
+$(Who $s) answered your question ("$($s.question)"): $($s.answer)
+
+Carry on from where you stopped: finish the change, run the checks, and commit when they pass. If you must ask again, ask the same way (QUESTION and OPTIONS lines). Finish with a short plain summary as before.
+"@
+  $extra = @("--allowedTools") + $SubthreadTools
+  if ($s.session) { $extra += @("--resume", [string]$s.session) } else { $prompt = "Task (you were working on this before): $($s.task)`n`n" + $prompt }
+  $p = Start-Claude $dir $wt $extra $prompt
+  $s.state = "working"; $s.resume = $false; $s | Add-Member -Force pid $p.Id; $s | Add-Member -Force startedAt ((Get-Date).ToUniversalTime().ToString("o"))
+  foreach ($k in "question", "options", "askedAt") { $s.PSObject.Properties.Remove($k) }
+  Save-Sub $s
+  Log "Build $($s.id) carrying on with the answer."
+}
+
+# A finished build run's question, if it asked one: QUESTION and OPTIONS lines at the end.
+function Read-Question([string]$text) {
+  $q = [regex]::Match($text, '(?m)^\s*\**QUESTION:?\**\s*(.+?)\s*$')
+  if (-not $q.Success) { return $null }
+  $o = [regex]::Match($text, '(?m)^\s*\**OPTIONS:?\**\s*(.+?)\s*$')
+  $opts = if ($o.Success) { @($o.Groups[1].Value -split '\s*\|\s*' | ForEach-Object { Clip $_ 200 } | Where-Object { $_ } | Select-Object -First 5) } else { @() }
+  return @{ question = (Clip $q.Groups[1].Value 600); options = $opts }
 }
 
 function Check-Subs {
@@ -502,6 +558,13 @@ function Check-Subs {
     $age = ((Get-Date).ToUniversalTime() - [DateTime]::Parse([string]$s.startedAt).ToUniversalTime()).TotalMinutes
     if ($running -and $age -lt $JobMinutes) { continue }
     if ($running) { Stop-Process -Id ([int]$s.pid) -Force -ErrorAction SilentlyContinue; $r = @{ ok = $false; text = "Still going after $JobMinutes minutes, so it was stopped." } } else { $r = Run-Result $dir }
+    if ($r.session) { $s | Add-Member -Force session ([string]$r.session) }
+    # A build that stopped on a question waits for the answer, its copy and session kept.
+    $ask = if ($s.build -and $r.ok) { Read-Question ([string]$r.text) } else { $null }
+    if ($ask) {
+      $s.state = "asking"; $s | Add-Member -Force question $ask.question; $s | Add-Member -Force options @($ask.options); $s | Add-Member -Force askedAt ((Get-Date).ToUniversalTime().ToString("o"))
+      Save-Sub $s; Log "Build $($s.id) is asking: $($ask.question)"; continue
+    }
     $s.state = $(if ($r.ok) { "done" } else { "failed" }); $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o"))
     Close-Worktree $s
     $where = if ($s.branch) { if ($s.kept) { " Branch $($s.branch) in $($s.folder): $($s.commits) commit$(if ($s.commits -ne 1) { 's' }).$(if ($s.leftover) { ' The last one holds changes it didn''t commit itself, so its checks may not pass, and it won''t go live.' })" } else { " It changed no files." } } else { "" }
@@ -515,9 +578,14 @@ function Check-Subs {
     Add-Note "Subthread $($s.id) `"$($s.title)`" ($($s.folder)) $($s.state): $(Clip $r.text 1200)$where"
     Log "Subthread $($s.id) $($s.state)."
   }
+  # A question unanswered for a day: its copy is closed (its work kept on its branch); an answer still picks it up.
+  foreach ($s in @(Get-Subthreads | Where-Object { $_.state -eq "asking" -and $_.askedAt -and ((Get-Date).ToUniversalTime() - [DateTime]::Parse([string]$_.askedAt).ToUniversalTime()).TotalHours -gt $AskHours })) {
+    Close-Worktree $s; $s.state = "parked"; Save-Sub $s; Log "Build $($s.id) parked: no answer for $AskHours hours."
+  }
   Check-Ships
-  # Waiting ones start as places free up; a project with no git gets one subthread at a time.
-  $working = @(Get-Subthreads | Where-Object { $_.state -eq "working" })
+  Check-Undos
+  # Waiting ones start as places free up (one waiting on an answer holds its place); a project with no git gets one subthread at a time.
+  $working = @(Get-Subthreads | Where-Object { $_.state -eq "working" -or $_.state -eq "asking" })
   foreach ($s in @(Get-Subthreads | Where-Object { $_.state -eq "queued" } | Sort-Object { [string]$_.queuedAt })) {
     if ($working.Count -ge $MaxSubthreads) { break }
     if (-not (Test-Path -LiteralPath (Join-Path ([string]$s.path) ".git")) -and @($working | Where-Object { $_.path -eq $s.path }).Count) { continue }
@@ -598,6 +666,94 @@ function Run-Ship([string]$sid) {
   }
 }
 
+# ---- Undo (4.0): a live build taken back out. Its own changes (its branch since it started) are reversed on the latest
+# main, checked, pushed and deployed like going live. Run by the relay, hidden: -Undo <id>.
+function Undo-Step([string]$sid, [string]$state, [string]$text, [string]$commit = "") {
+  $file = Ship-File $sid "undo.json"
+  $u = Read-Json $file; if (-not $u) { $u = [pscustomobject]@{ state = $state; steps = @() } }
+  $u.state = $state
+  if ($text) { $u.steps = @(@($u.steps) + @([pscustomobject]@{ at = (Get-Date).ToUniversalTime().ToString("o"); text = (Clip $text 200) }) | Select-Object -Last 10); $u | Add-Member -Force detail (Clip $text 1500) }
+  if ($commit) { $u | Add-Member -Force commit $commit }
+  Write-Json $file $u
+  Log "Undo, ${sid}: $(Clip $text 300)"
+}
+
+function Run-Undo([string]$sid) {
+  $ErrorActionPreference = "Continue"
+  $s = Read-Json (Ship-File $sid "sub.json")
+  if (-not $s) { return }
+  $g = $GoLive[([string]$s.folder).ToLower()]
+  if (-not $g) { Undo-Step $sid "failed" "$($s.folder) has no go-live steps."; return }
+  $repo = [string]$s.path; $branch = [string]$s.branch
+  $wt = Join-Path $repo ".claude\worktrees\tyrone-undo-$($sid.Substring(3))"
+  $patch = Ship-File $sid "undo.patch"
+  try {
+    Undo-Step $sid "going" "Getting the latest $($s.folder) from GitHub"
+    & git -C $repo fetch -q origin 2>$null | Out-Null
+    if ($LASTEXITCODE) { throw "Couldn't reach GitHub (git fetch failed), so nothing was undone." }
+    Remove-Worktree $repo $wt
+    & git -C $repo worktree add -q --detach $wt origin/main 2>$null | Out-Null
+    if (-not (Test-Path -LiteralPath $wt)) { throw "Couldn't make a copy of main, so nothing was undone." }
+    Link-Packages $repo $wt
+    Undo-Step $sid "going" "Reversing its changes on main"
+    & cmd.exe /c "git -C `"$repo`" diff --binary $($s.base) $branch > `"$patch`"" 2>$null
+    if (-not (Test-Path -LiteralPath $patch) -or (Get-Item -LiteralPath $patch).Length -eq 0) { throw "Its changes couldn't be found on $branch, so nothing was undone." }
+    $out = (& git -C $wt apply -R --3way $patch 2>&1 | Out-String)
+    if ($LASTEXITCODE -or @(& git -C $wt diff --name-only --diff-filter=U 2>$null).Count) { throw "Newer changes on main touch the same lines, so it can't be taken out cleanly; nothing was pushed. $(Clip $out 300)" }
+    & git -C $wt add -A 2>$null | Out-Null
+    & git -C $wt commit -q -m "Undo: $($s.title) (Tyrone)" 2>$null | Out-Null
+    if ($LASTEXITCODE) { throw "There was nothing left to take out (main no longer has its changes)." }
+    $null = (& git -C $wt merge --no-edit -m "Merge origin/$($g.branch) (Tyrone undo)" "origin/$($g.branch)" 2>&1 | Out-String)
+    if ($LASTEXITCODE) { & git -C $wt merge --abort 2>$null | Out-Null; throw "It clashes with newer changes on $($g.branch), so nothing was pushed." }
+    Push-Live $sid $wt $g { param($st, $tx, $c) Undo-Step $sid $(if ($st -eq "live") { "done" } else { $st }) $tx $c } "Undone"
+  } catch {
+    Undo-Step $sid "failed" ([string]$_.Exception.Message)
+  } finally {
+    Remove-Worktree $repo $wt
+    Remove-Item -LiteralPath $patch -Force -ErrorAction SilentlyContinue
+  }
+}
+
+# The checks on the result, then push to main (and the deploy branch), deploy and wait for it to be live. $step is
+# called with (state, text, commit): "going" as it goes, "live" at the end; it throws when something fails.
+function Push-Live([string]$sid, [string]$wt, $g, [scriptblock]$step, [string]$doneWord = "Live") {
+  foreach ($c in @($g.checks | Where-Object { $_ })) {
+    & $step "going" "Running $c on the result" ""
+    Push-Location -LiteralPath $wt
+    $savedPath = $env:PATH; $savedVenv = $env:VIRTUAL_ENV; $savedNoColor = $env:NO_COLOR; $savedForce = $env:FORCE_COLOR
+    try { Use-ProjectTools $wt; $env:NO_COLOR = "1"; $env:FORCE_COLOR = "0"; $out = (& cmd.exe /c "$c 2>&1" | Out-String) -replace '\x1b\[[0-9;?]*[A-Za-z]', ''; $code = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:VIRTUAL_ENV = $savedVenv; $env:NO_COLOR = $savedNoColor; $env:FORCE_COLOR = $savedForce; Pop-Location }
+    if ($code) { throw "$c failed, so nothing was pushed. The end of its output: $(Clip ((@($out -split "`n" | Where-Object { $_.Trim() }) | Select-Object -Last 12) -join ' | ') 700)" }
+  }
+  $commit = (& git -C $wt rev-parse HEAD 2>$null | Out-String).Trim()
+  $h8 = $commit.Substring(0, 8)
+  & $step "going" "Pushing $h8 to main and $($g.branch)" $commit
+  $refs = @("HEAD:refs/heads/main") + $(if ($g.branch -and $g.branch -ne "main") { @("HEAD:refs/heads/$($g.branch)") } else { @() })
+  $out = (& git -C $wt push -q origin @refs 2>&1 | Out-String)
+  if ($LASTEXITCODE) { throw "GitHub refused the push (someone may have pushed at the same moment), so nothing changed. $(Clip $out 300)" }
+  if (-not $g.host) { & $step "live" "$doneWord`: pushed $h8 to main and $($g.branch)." $commit; return }
+  & $step "going" "Deploying $h8 to $($g.branch)" $commit
+  $out = (& ssh -o BatchMode=yes -o ConnectTimeout=15 $g.host $g.deploy 2>&1 | Out-String)
+  if ($LASTEXITCODE) { throw "It's pushed to main and $($g.branch) ($h8), but the deploy couldn't start: $(Clip $out 300)" }
+  $until = (Get-Date).AddMinutes($GoLiveMinutes)
+  while ((Get-Date) -lt $until) {
+    $st = (& ssh -o BatchMode=yes -o ConnectTimeout=15 $g.host $g.status 2>&1 | Out-String)
+    if (@($st -split "`n" | Where-Object { $_ -match "^\s*$([regex]::Escape($g.app))\s" -and $_ -match "$h8 live" }).Count) { & $step "live" "$doneWord on $($g.branch): $h8." $commit; return }
+    Start-Sleep -Seconds 20
+  }
+  throw "Pushed $h8 to main and $($g.branch) and started the deploy, but it didn't show as live within $GoLiveMinutes minutes. Check ltg-dev-deploy status."
+}
+
+# An undo whose hidden process died (the PC restarted) is marked failed, so it can be asked for again.
+function Check-Undos {
+  foreach ($s in @(Get-Subthreads | Where-Object { $_.build })) {
+    $u = Read-Json (Ship-File $s.id "undo.json")
+    if (-not $u -or $u.state -ne "going") { continue }
+    $pidFile = Ship-File $s.id "undo.pid"
+    $p = if (Test-Path -LiteralPath $pidFile) { Get-Process -Id ([int](Get-Content -LiteralPath $pidFile -Raw)) -ErrorAction SilentlyContinue } else { $null }
+    if (-not ($p -and -not $p.HasExited -and $p.ProcessName -match "powershell")) { Undo-Step $s.id "failed" "The undo stopped partway (the PC may have restarted). Ask again to take it out." }
+  }
+}
+
 # Starts waiting ones (one per project at a time), notices one that died, and tells the Tyrone thread how each ended.
 function Check-Ships {
   $all = @(Get-Subthreads)
@@ -631,10 +787,13 @@ function Live-Body {
     if ($j -and (Is-Running $j)) { $st = Read-Stream $d.FullName; $job = @{ id = $d.Name; task = (Clip ([string]$j.task) 300); startedAt = ([DateTime]::Parse([string]$j.started)).ToUniversalTime().ToString("o"); steps = @($st.steps | Select-Object -Last 10) } }
   }
   $day = (Get-Date).ToUniversalTime().AddHours(-24)
-  $subs = @(Get-Subthreads | Where-Object { $_.state -eq "queued" -or $_.state -eq "working" -or ($_.finishedAt -and [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime() -gt $day) -or (Test-Path -LiteralPath (Ship-File $_.id "ship.pid")) -and -not (Test-Path -LiteralPath (Ship-File $_.id "ship.told")) } | ForEach-Object {
+  $subs = @(Get-Subthreads | Where-Object { @("queued", "working", "asking", "parked") -contains [string]$_.state -or ($_.finishedAt -and [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime() -gt $day) -or (Test-Path -LiteralPath (Ship-File $_.id "ship.pid")) -and -not (Test-Path -LiteralPath (Ship-File $_.id "ship.told")) -or ((Test-Path -LiteralPath (Ship-File $_.id "undo.json")) -and (Get-Item -LiteralPath (Ship-File $_.id "undo.json")).LastWriteTimeUtc -gt $day) } | ForEach-Object {
     $st = if ($_.state -eq "working") { Read-Stream (Join-Path $SubDir $_.id) } else { $null }
     $o = [ordered]@{ id = $_.id; title = $_.title; folder = $_.folder; state = $_.state }
-    foreach ($k in "queuedAt", "startedAt", "finishedAt", "branch", "result") { if ($_.$k) { $o[$k] = [string]$_.$k } }
+    foreach ($k in "queuedAt", "startedAt", "finishedAt", "branch", "result", "list", "item", "question") { if ($_.$k) { $o[$k] = [string]$_.$k } }
+    if ($_.options) { $o.options = @($_.options | ForEach-Object { [string]$_ }) }
+    $u = Read-Json (Ship-File $_.id "undo.json")
+    if ($u) { $o.undo = [ordered]@{ state = [string]$u.state; detail = [string]$u.detail }; if ($u.commit) { $o.undo.commit = [string]$u.commit } }
     if ($st) { $o.steps = @($st.steps | Select-Object -Last 6) }
     $g = Read-Json (Ship-File $_.id "ship.json")
     if ($g) { $o.ship = [ordered]@{ state = [string]$g.state; detail = [string]$g.detail; steps = @($g.steps | Select-Object -Last 6) }; if ($g.commit) { $o.ship.commit = [string]$g.commit } }
@@ -653,17 +812,69 @@ function Send-Live([string]$key) {
   $script:LastLive = $body; $script:LastLiveAt = Get-Date
 }
 
-function Busy { return [bool]((@(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { -not (Test-Path (Join-Path $_.FullName "done.txt")) -and (Test-Path (Join-Path $_.FullName "job.json")) }).Count) -or @(Get-Subthreads | Where-Object { $_.state -eq "working" -or $_.state -eq "queued" -or @("waiting", "going") -contains [string](Read-Json (Ship-File $_.id "ship.json")).state }).Count) }
+function Busy { return [bool]((@(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { -not (Test-Path (Join-Path $_.FullName "done.txt")) -and (Test-Path (Join-Path $_.FullName "job.json")) }).Count) -or @(Get-Subthreads | Where-Object { $_.state -eq "working" -or $_.state -eq "queued" -or @("waiting", "going") -contains [string](Read-Json (Ship-File $_.id "ship.json")).state -or [string](Read-Json (Ship-File $_.id "undo.json")).state -eq "going" }).Count) }
+
+# ---- Tyrone building himself (4.0): an item from his features and bugs list, straight to a subthread ----
+function Find-Sub([string]$sid, [string]$item) {
+  $all = @(Get-Subthreads)
+  $hit = if ($sid) { $all | Where-Object { $_.id -eq $sid } | Select-Object -First 1 } else { $null }
+  if (-not $hit -and $item) { $hit = $all | Where-Object { [string]$_.item -eq $item } | Sort-Object { [string]$_.queuedAt } -Descending | Select-Object -First 1 }
+  return $hit
+}
+
+function Take-Build($key, $t) {
+  $b = $t.claude.build; $id = [string]$t.id
+  $dir = Join-Path $JobsDir $id
+  if (Test-Path $dir) { return }
+  $null = New-Item -ItemType Directory -Force $dir
+  $finish = { param($ok, $text) Report $key $id $(if ($ok) { "done" } else { "failed" }) $text | Out-Null; Set-Content (Join-Path $dir "done.txt") $(if ($ok) { "done" } else { "failed" }) }
+  switch ([string]$b.kind) {
+    "build" {
+      $problem = Claude-Problem
+      $match = (Get-JobFolders)[$BuildFolder]
+      if (-not $problem -and -not $match) { $problem = "$BuildFolder isn't a project on this PC (no Claude Code thread ran there in the last 30 days)." }
+      if ($problem) { & $finish $false $problem; Log "Build $id not started: $problem"; return }
+      $sid = "st-" + ([guid]::NewGuid().ToString("N").Substring(0, 6))
+      $null = New-Item -ItemType Directory -Force (Join-Path $SubDir $sid)
+      $title = Clip $(if ($b.title) { [string]$b.title } else { [string]$t.task }) 80
+      Save-Sub ([pscustomobject]@{ id = $sid; title = $title; folder = $match.name; path = $match.path; task = [string]$t.task; state = "queued"; queuedAt = (Get-Date).ToUniversalTime().ToString("o"); list = [string]$b.listId; item = [string]$b.itemId; from = [string]$t.from; build = $true })
+      & $finish $true "Building it in subthread $sid."
+      Log "Build $sid queued: $title."
+    }
+    "answer" {
+      $s = Find-Sub ([string]$b.sub) ([string]$b.itemId)
+      if (-not $s -or @("asking", "parked") -notcontains [string]$s.state) { & $finish $false "That build isn't waiting on an answer any more."; return }
+      $s.state = "queued"; $s | Add-Member -Force answer ([string]$b.answer); $s | Add-Member -Force resume $true; $s | Add-Member -Force queuedAt ((Get-Date).ToUniversalTime().ToString("o")); Save-Sub $s
+      & $finish $true "Passed on; it carries on."
+      Log "Build $($s.id) answered."
+    }
+    "undo" {
+      $s = Find-Sub ([string]$b.sub) ([string]$b.itemId)
+      $g = if ($s) { Read-Json (Ship-File $s.id "ship.json") } else { $null }
+      if (-not $s -or -not $g -or $g.state -ne "live") { & $finish $false "That build isn't live, so there's nothing to undo."; return }
+      $u = Read-Json (Ship-File $s.id "undo.json")
+      if ($u -and $u.state -eq "going") { & $finish $true "Already being undone."; return }
+      Write-Json (Ship-File $s.id "undo.json") ([pscustomobject]@{ state = "going"; steps = @(); detail = "Starting" })
+      $p = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Undo $($s.id)" -WindowStyle Hidden -PassThru
+      Set-Content -LiteralPath (Ship-File $s.id "undo.pid") -Value $p.Id
+      & $finish $true "Taking it back out."
+      Log "Build $($s.id) being undone."
+    }
+    default { & $finish $false "Unknown build step." }
+  }
+}
 
 function Poll-Jobs([string]$key) {
   $null = New-Item -ItemType Directory -Force $JobsDir, $SubDir, $WtDir, $SpawnDir
   $tasks = @(((Web $key).DownloadString($TasksUrl) | ConvertFrom-Json).tasks)
   $open = @($tasks | ForEach-Object { [string]$_.id })
+  # Builds go straight to a subthread, not the Tyrone thread.
+  foreach ($t in @($tasks | Where-Object { $_.claude -and $_.claude.build })) { Take-Build $key $t }
   Check-Jobs $key $open
   # One Tyrone job at a time: the next one starts when it's free.
   $running = @(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { (Test-Path (Join-Path $_.FullName "job.json")) -and -not (Test-Path (Join-Path $_.FullName "done.txt")) }).Count
   if (-not $running) {
-    $next = $tasks | Where-Object { $_.claude -and -not (Test-Path (Join-Path $JobsDir ([string]$_.id))) } | Select-Object -First 1
+    $next = $tasks | Where-Object { $_.claude -and -not $_.claude.build -and -not (Test-Path (Join-Path $JobsDir ([string]$_.id))) } | Select-Object -First 1
     if ($next) { Start-TyroneJob $key $next }
   }
   # Old job folders go after a week.
@@ -762,6 +973,8 @@ if ($DryRun) { ConvertTo-Json -InputObject @{ threads = @(Get-Threads); folders 
 
 # -Ship <subthread id>: the relay starts this, hidden, to put one finished subthread live.
 if ($Ship) { Run-Ship $Ship; exit 0 }
+# -Undo <subthread id>: the relay starts this, hidden, to take a live build back out.
+if ($Undo) { Run-Undo $Undo; exit 0 }
 
 $key = Get-Key
 if (-not $key) { Write-Host "Not connected yet: run ClaudeRelay.ps1 -Connect" -ForegroundColor Yellow; exit 1 }
