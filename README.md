@@ -92,5 +92,5 @@ Every two minutes it reads the desktop app's session files on that PC and sends 
 1. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Connect`, then press **Connect Claude relay** on the page that opens. The key is kept encrypted for your Windows account in `%LOCALAPPDATA%\ClaudeRelay`.
 2. `powershell -ExecutionPolicy Bypass -File ClaudeRelay.ps1 -Install` copies it to `%LOCALAPPDATA%\ClaudeRelay` and starts it hidden at every sign-in (a scheduled task named Claude relay).
 
-`-DryRun` shows what it would send; `-Once` sends once; `-Uninstall` removes the scheduled task. Its log is `%LOCALAPPDATA%\ClaudeRelayelay.log`. Revoke the key on Project Check-in's Datalink page.
+`-DryRun` shows what it would send; `-Once` sends once; `-Uninstall` removes the scheduled task. Its log is `%LOCALAPPDATA%\ClaudeRelay\relay.log`. Revoke the key on Project Check-in's Datalink page.
 
