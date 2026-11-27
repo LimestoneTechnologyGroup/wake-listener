@@ -35,10 +35,10 @@
 #
 # The key is kept encrypted for your Windows account (DPAPI) in
 # %LOCALAPPDATA%\ClaudeRelay. Revoke it on Project Check-in's Datalink page.
-param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
+param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [switch]$Branches, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "4.0.2"
+$Version = "4.1.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -800,6 +800,118 @@ function Check-Ships {
   }
 }
 
+# ---- Merged by hand (4.1): what actually happened to each tyrone/ branch after the relay was done with it ----
+# A branch that didn't go live on its own (a clash, a failed check, a project with no go-live steps) is often merged
+# by someone later, sometimes as a copy brought up to main. Every two minutes the relay looks at git and the devbox:
+# each tyrone/ branch is "merged" (its last commit is in main's history), "copied" (main has the same changes, or a
+# commit on main names its last commit), or not on main yet; one that's on main is checked against the deploy
+# branch and what's live. Each subthread's merged.json is updated, and the whole list goes to the app with the live
+# report, so Tyrone's job list says what really happened.
+$BranchesFile = Join-Path $Folder "branches.json"
+$script:BranchList = @()
+
+function Git-Lines([string]$repo, [string[]]$a) { $ErrorActionPreference = "Continue"; return @(& git -C $repo @a 2>$null | Where-Object { $_ }) }
+function Git-One([string]$repo, [string[]]$a) { $l = @(Git-Lines $repo $a); if ($l.Count) { return [string]$l[0] }; return "" }
+function Git-Ok([string]$repo, [string[]]$a) { $ErrorActionPreference = "Continue"; & git -C $repo @a 2>$null | Out-Null; return $LASTEXITCODE -eq 0 }
+
+# Where a branch's work is on main: @{ how = "merged" | "copied"; commit = the first main commit that has it }, or $null.
+function Find-OnMain([string]$repo, [string]$branch, [string]$head, [string]$base) {
+  if (Git-Ok $repo @("merge-base", "--is-ancestor", $head, "origin/main")) {
+    $first = @(Git-Lines $repo @("rev-list", "--ancestry-path", "--reverse", "$head..origin/main") | Select-Object -First 1)
+    return @{ how = "merged"; commit = $(if ($first.Count) { [string]$first[0] } else { $head }) }
+  }
+  $since = @(Git-Lines $repo @("log", "-1", "--format=%cI", $head))
+  # A copy brought up to main says where it came from ("... from 3c991fc", "Merge tyrone/..."): the oldest such commit.
+  foreach ($needle in @($head.Substring(0, 7), $branch)) {
+    $a = @("log", "origin/main", "--fixed-strings", "--grep=$needle", "--format=%H"); if ($since.Count) { $a += "--since=$($since[0])" }
+    $hit = @(Git-Lines $repo $a | Select-Object -Last 1)
+    if ($hit.Count) { return @{ how = "copied"; commit = [string]$hit[0] } }
+  }
+  # The same changes, commit for commit (cherry-picked or rebased onto main).
+  if ($base) {
+    $ch = @(Git-Lines $repo @("cherry", "origin/main", $head, $base))
+    if ($ch.Count -and -not @($ch | Where-Object { $_ -like "+*" }).Count) { return @{ how = "copied"; commit = (Git-One $repo @("rev-parse", "origin/main")) } }
+  }
+  return $null
+}
+
+# The commit live on the devbox for a go-live recipe (its full hash), or "" when it can't be read.
+function Live-Commit([string]$repo, $g) {
+  if (-not $g.host -or -not $g.status) { return "" }
+  $ErrorActionPreference = "Continue"
+  $st = (& ssh -o BatchMode=yes -o ConnectTimeout=15 $g.host $g.status 2>&1 | Out-String)
+  $m = [regex]::Match($st, "(?m)^\s*$([regex]::Escape($g.app))\s.*?\b([0-9a-f]{8}) live\b")
+  if (-not $m.Success) { return "" }
+  return (Git-One $repo @("rev-parse", "--verify", "-q", "$($m.Groups[1].Value)^{commit}"))
+}
+
+function Check-Merged {
+  $ErrorActionPreference = "Continue"
+  $subs = @(Get-Subthreads)
+  # Every repo a subthread worked in, and each project with go-live steps.
+  $repos = @{}
+  foreach ($s in $subs) { if ($s.path -and (Test-Path -LiteralPath (Join-Path ([string]$s.path) ".git"))) { $repos[([string]$s.path).ToLower()] = @{ path = [string]$s.path; name = [string]$s.folder } } }
+  $known = Get-JobFolders
+  foreach ($k in $GoLive.Keys) { $f = $known[$k]; if ($f -and (Test-Path -LiteralPath (Join-Path $f.path ".git"))) { $repos[$f.path.ToLower()] = @{ path = $f.path; name = $f.name } } }
+  $cache = @{}; $old = Read-Json $BranchesFile
+  if ($old) { foreach ($b in @($old.branches)) { $cache["$($b.folder)|$($b.branch)"] = $b } }
+  $out = @()
+  foreach ($r in $repos.Values) {
+    $repo = $r.path
+    $refs = @(Git-Lines $repo @("for-each-ref", "--format=%(refname:short)`t%(objectname)`t%(committerdate:iso-strict)", "refs/heads/tyrone/"))
+    if (-not $refs.Count) { continue }
+    $null = Git-Ok $repo @("fetch", "-q", "origin")
+    $mainTip = Git-One $repo @("rev-parse", "origin/main")
+    $g = $GoLive[([string]$r.name).ToLower()]
+    $devTip = if ($g -and $g.branch -and $g.branch -ne "main") { Git-One $repo @("rev-parse", "origin/$($g.branch)") } else { $mainTip }
+    $live = $null
+    foreach ($line in $refs) {
+      $p = $line -split "`t"; $branch = $p[0]; $head = $p[1]
+      $sub = $subs | Where-Object { $_.branch -eq $branch } | Select-Object -First 1
+      $c = $cache["$($r.name)|$branch"]
+      # Settled ones aren't looked at again; others when the branch or main moved, or (on main) when dev or what's live may have.
+      if ($c -and $c.head -eq $head -and ($c.live -or ($c.mainTip -eq $mainTip -and -not $c.onMain))) { $out += $c; continue }
+      $hit = Find-OnMain $repo $branch $head $(if ($sub) { [string]$sub.base } else { "" })
+      $b = [ordered]@{ folder = $r.name; branch = $branch; head = $head; at = $p[2]; mainTip = $mainTip; onMain = [bool]$hit; checkedAt = (Get-Date).ToUniversalTime().ToString("o") }
+      if ($hit) {
+        $b.how = $hit.how; $b.commit = $hit.commit
+        $b.onDev = Git-Ok $repo @("merge-base", "--is-ancestor", $hit.commit, $devTip)
+        if ($b.onDev) {
+          if (-not $g -or -not $g.host) {
+            # Deploys itself when pushed (officepet), or no deploy steps known: on the branch is as far as the relay can see.
+            if ($g) { $b.live = $true; $b.deploy = $hit.commit }
+          } else {
+            if ($null -eq $live) { $live = Live-Commit $repo $g }
+            if ($live -and (Git-Ok $repo @("merge-base", "--is-ancestor", $hit.commit, $live))) { $b.live = $true; $b.deploy = $live }
+          }
+        }
+      }
+      if (-not $b.live) { $b.live = $false }
+      $out += [pscustomobject]$b
+    }
+  }
+  $script:BranchList = @($out | Sort-Object { [string]$_.at } -Descending)
+  Write-Json $BranchesFile ([pscustomobject]@{ at = (Get-Date).ToUniversalTime().ToString("o"); branches = $script:BranchList })
+  # Each subthread that didn't go live on its own hears where its branch ended up.
+  foreach ($s in $subs) {
+    if (-not $s.branch -or -not $s.kept) { continue }
+    $sh = Read-Json (Ship-File $s.id "ship.json")
+    if ($sh -and @("waiting", "going", "live") -contains [string]$sh.state) { continue }
+    $b = $script:BranchList | Where-Object { $_.branch -eq $s.branch -and $_.onMain } | Select-Object -First 1
+    if (-not $b) { continue }
+    $m = [ordered]@{ state = $(if ($b.live) { "live" } else { "merged" }); how = [string]$b.how; commit = [string]$b.commit }
+    if ($b.onDev) { $m.onDev = $true }
+    if ($b.deploy) { $m.deploy = [string]$b.deploy }
+    $file = Ship-File $s.id "merged.json"
+    $was = Read-Json $file
+    if ($was -and $was.state -eq $m.state -and [string]$was.commit -eq $m.commit -and [string]$was.deploy -eq [string]$m.deploy) { continue }
+    $m.at = (Get-Date).ToUniversalTime().ToString("o")
+    Write-Json $file ([pscustomobject]$m)
+    Add-Note "Subthread $($s.id) `"$($s.title)`" ($($s.folder)) was $(if ($m.how -eq 'copied') { 'copied' } else { 'merged' }) into main by hand ($($m.commit.Substring(0, 8)))$(if ($m.state -eq 'live') { " and is live$(if ($m.deploy) { " ($($m.deploy.Substring(0, 8)))" })" })."
+    Log "Subthread $($s.id) $($m.state) by hand: $($m.how) in $($m.commit.Substring(0, 8))$(if ($m.deploy) { ", live $($m.deploy.Substring(0, 8))" })."
+  }
+}
+
 # ---- Live: what the Tyrone thread and its subthreads are doing, step by step, for Talk ----
 function Live-Body {
   $job = $null
@@ -816,7 +928,8 @@ function Live-Body {
     $recent = [bool]($_.finishedAt -and [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime() -gt $day)
     $shipping = (Test-Path -LiteralPath (Ship-File $_.id "ship.pid")) -and -not (Test-Path -LiteralPath (Ship-File $_.id "ship.told"))
     $undoing = (Test-Path -LiteralPath (Ship-File $_.id "undo.json")) -and ((Get-Item -LiteralPath (Ship-File $_.id "undo.json")).LastWriteTimeUtc -gt $day)
-    $active -or $recent -or $shipping -or $undoing
+    $mergedLately = (Test-Path -LiteralPath (Ship-File $_.id "merged.json")) -and ((Get-Item -LiteralPath (Ship-File $_.id "merged.json")).LastWriteTimeUtc -gt $day)
+    $active -or $recent -or $shipping -or $undoing -or $mergedLately
   } | ForEach-Object {
     $st = if ($_.state -eq "working") { Read-Stream (Join-Path $SubDir $_.id) } else { $null }
     $o = [ordered]@{ id = $_.id; title = $_.title; folder = $_.folder; state = $_.state }
@@ -827,9 +940,17 @@ function Live-Body {
     if ($st) { $o.steps = @($st.steps | Select-Object -Last 6) }
     $g = Read-Json (Ship-File $_.id "ship.json")
     if ($g) { $o.ship = [ordered]@{ state = [string]$g.state; detail = [string]$g.detail; steps = @($g.steps | Select-Object -Last 6) }; if ($g.commit) { $o.ship.commit = [string]$g.commit } }
+    $m = Read-Json (Ship-File $_.id "merged.json")
+    if ($m) { $o.merged = [ordered]@{ state = [string]$m.state; how = [string]$m.how; commit = [string]$m.commit; at = [string]$m.at }; if ($m.onDev) { $o.merged.onDev = $true }; if ($m.deploy) { $o.merged.deploy = [string]$m.deploy } }
     $o
   })
-  return @{ tyrone = @{ version = $Version; state = $(if ($job) { "working" } else { "idle" }); job = $job; subthreads = $subs; max = $MaxSubthreads } }
+  # Every tyrone/ branch and whether it's on main, dev and live (newest first), as of the last check.
+  $branches = @($script:BranchList | Select-Object -First 60 | ForEach-Object {
+    $b = [ordered]@{ folder = [string]$_.folder; branch = [string]$_.branch; head = [string]$_.head; at = [string]$_.at; onMain = [bool]$_.onMain; checkedAt = [string]$_.checkedAt }
+    if ($_.onMain) { $b.how = [string]$_.how; $b.commit = [string]$_.commit; $b.onDev = [bool]$_.onDev; $b.live = [bool]$_.live; if ($_.deploy) { $b.deploy = [string]$_.deploy } }
+    $b
+  })
+  return @{ tyrone = @{ version = $Version; state = $(if ($job) { "working" } else { "idle" }); job = $job; subthreads = $subs; max = $MaxSubthreads; branches = $branches } }
 }
 
 $script:LastLive = ""; $script:LastLiveAt = [DateTime]::MinValue
@@ -881,7 +1002,8 @@ function Take-Build($key, $t) {
     "undo" {
       $s = Find-Sub ([string]$b.sub) ([string]$b.itemId)
       $g = if ($s) { Read-Json (Ship-File $s.id "ship.json") } else { $null }
-      if (-not $s -or -not $g -or $g.state -ne "live") { & $finish $false "That build isn't live, so there's nothing to undo."; return }
+      $hand = if ($s) { Read-Json (Ship-File $s.id "merged.json") } else { $null }
+      if (-not $s -or -not (($g -and $g.state -eq "live") -or ($hand -and $hand.state -eq "live"))) { & $finish $false "That build isn't live, so there's nothing to undo."; return }
       $u = Read-Json (Ship-File $s.id "undo.json")
       if ($u -and $u.state -eq "going") { & $finish $true "Already being undone."; return }
       Write-Json (Ship-File $s.id "undo.json") ([pscustomobject]@{ state = "going"; steps = @(); detail = "Starting" })
@@ -1001,6 +1123,8 @@ if ($Doctor) {
 
 if ($DryRun) { ConvertTo-Json -InputObject @{ threads = @(Get-Threads); folders = @((Get-JobFolders).Values | ForEach-Object { $_.name } | Sort-Object) } -Depth 4; exit 0 }
 
+# -Branches: checks every tyrone/ branch now and shows where each is (on main, on dev, live), sends nothing.
+if ($Branches) { Check-Merged; ConvertTo-Json -InputObject @($script:BranchList) -Depth 4; exit 0 }
 # -Ship <subthread id>: the relay starts this, hidden, to put one finished subthread live.
 if ($Ship) { Run-Ship $Ship; exit 0 }
 # -Undo <subthread id>: the relay starts this, hidden, to take a live build back out.
@@ -1021,6 +1145,8 @@ while ($true) {
     $note = if (-not $key) { "Not connected: run ClaudeRelay.ps1 -Connect" } else { try { Send-Threads $key } catch { "Not sent: " + (Why $_) } }
     # The log gets a line when something changes, not every two minutes.
     if ($note -ne $lastNote) { Log $note; $lastNote = $note }
+    # Where each tyrone/ branch ended up (merged or copied into main by hand, deployed), for Tyrone's job list.
+    try { Check-Merged } catch { Log ("Branches not checked: " + (Why $_)) }
     $nextThreads = (Get-Date).AddMinutes(2)
   }
   if ($key) {
