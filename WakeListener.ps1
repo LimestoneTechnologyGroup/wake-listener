@@ -1,11 +1,12 @@
-﻿# Wake listener: say "hey Tyrone" and your Project Check-in assistant opens.
+﻿# Wake listener: say "hey Smokey" and your Project Check-in assistant opens.
+# ("hey Tyrone", the assistant's old name, still works for now.)
 #
 # Plain PowerShell, no exe. The listening is done by listen.py (next to this
 # file) in two stages, the way smart speakers work: a small keyword spotter
 # (sherpa-onnx) catches anything like the phrase, then a speech-to-text model
-# (Moonshine) checks the words before it opens. Since 6.6 a small detector
-# trained on "hey Tyrone" (hey_tyrone.onnx and the two openWakeWord front-end
-# models next to this file) can call for the check too. It runs on this PC;
+# (Moonshine) checks the words before it opens. Since 6.6 small detectors
+# trained on each phrase (hey_smokey.onnx and hey_tyrone.onnx next to this
+# file, on openWakeWord's front end) can call for the check too. It runs on this PC;
 # nothing is sent anywhere. The first run sets it up (Python, the engine and
 # its models, about 125 MB, in %LOCALAPPDATA%\WakeListener). When it hears the phrase it
 # opens the assistant's voice page, which starts talking.
@@ -21,10 +22,11 @@
 
 param([switch]$Test)
 
-$Version = "6.6.0"
+$Version = "6.7.0"
 
 # ---- Settings ---------------------------------------------------------------
-$Phrase        = "hey Tyrone"   # what you'll say (two or three words work best)
+$Phrase        = "hey Smokey|hey Tyrone"   # what you'll say (two or three words work best); | between phrases for either
+$PhraseShown   = ($Phrase -split "\|")[0].Trim()   # the one the windows mention
 $Url           = "https://project-checkin.dev.limestonetg.com/assistant?start=voice&close=1"   # close=1: the window closes itself once the conversation is saved
 $Browser       = "edge-app"     # edge-app, chrome-app, or default
 # How easily it opens: low, normal or high. Also on the tray icon's menu, which remembers your choice.
@@ -220,9 +222,12 @@ if ($Test) {
     return @($lines | Where-Object { "$_" -like "wake|*" }).Count
   }
   $checks = @(
-    @($Phrase, $a, 0, $false, $true), @($Phrase, $b, 0, $false, $true), @($Phrase, $a, 3, $false, $true), @($Phrase, $b, -3, $false, $true),
-    @($Phrase, $a, 0, $true, $true), @($Phrase, $b, 1, $true, $true),
-    @("$Phrase, what's on my calendar today", $a, 0, $false, $true),
+    @("hey Smokey", $a, 0, $false, $true), @("hey Smokey", $b, 0, $false, $true), @("hey Smokey", $a, 3, $false, $true), @("hey Smokey", $b, -3, $false, $true),
+    @("hey Smokey", $a, 0, $true, $true), @("hey Smokey", $b, 1, $true, $true),
+    @("hey Smokey, what's on my calendar today", $a, 0, $false, $true),
+    @("hey Tyrone", $a, 0, $false, $true), @("hey Tyrone", $b, 0, $true, $true),
+    @("we drove through the Smoky Mountains", $a, 0, $false, $false), @("Smokey is the Tennessee mascot", $b, 0, $false, $false),
+    @("the smoke detector is beeping", $a, 0, $false, $false), @("hey Mikey", $b, 0, $false, $false),
     @("Tyrone called about the permit yesterday", $a, 0, $false, $false), @("My brother Tyrone is coming over tonight", $b, 0, $false, $false),
     @("hey how are you", $b, 0, $false, $false), @("send the budget to finance", $a, 0, $true, $false),
     @("hey there Ron", $a, 0, $false, $false), @("hey Tony, grab the keys", $b, 0, $false, $false), @("high tone", $a, 0, $false, $false))
@@ -381,7 +386,7 @@ function Test-AssistantOpen {
     return [WakeListenerWindows.Browser]::HasWindow($AssistantTitle)
   } catch { $false }
 }
-# Shows Tyrone's window (it may be hidden); false when there's none.
+# Shows Smokey's window (it may be hidden); false when there's none.
 function Show-Assistant {
   $w = if ([WakeListenerWindows.Browser]::Alive($script:assistantWindow, $AssistantTitle)) { $script:assistantWindow } else { [WakeListenerWindows.Browser]::Find($AssistantTitle) }
   return [WakeListenerWindows.Browser]::Reveal($w)
@@ -466,13 +471,13 @@ Add-Type -Path (Join-Path $PSScriptRoot "WakeUi.cs") -ReferencedAssemblies Syste
 $script:activity = New-Object WakeUi.Activity("Wake listener " + $Version)
 
 # ---- The floating button ----------------------------------------------------
-# Floating Tyrone (WakeUi.cs): always on top. It shows whether Tyrone is
+# Floating Smokey (WakeUi.cs): always on top. It shows whether Smokey is
 # listening, and Start or Stop: Start opens the assistant, Stop ends the
 # conversation the way End discussion does (so it's saved). Click it to bring
 # the assistant to the front; double-click it for the activity window; drag it
 # anywhere (it's remembered); right-click for the menu. Under it, what you
 # chose from "Show on the button": to-dos due today, Kitchen orders, the next
-# meeting, the last talk with Tyrone (read from Project Check-in with your key).
+# meeting, the last talk with Smokey (read from Project Check-in with your key).
 $GlanceUrl = ($Url -replace "/assistant.*$", "") + "/api/teams/messages/intake/summary"
 $script:pillColors = @{
   listening = [System.Drawing.Color]::FromArgb(74, 222, 128); open = [System.Drawing.Color]::FromArgb(96, 165, 250); connecting = [System.Drawing.Color]::FromArgb(147, 197, 253)
@@ -492,7 +497,7 @@ if ($placed -match "^(-?\d+),(-?\d+)$") {
 $pill.Location = $at
 
 # What to show under it, and the key it reads your day with.
-$script:showChoices = @(@("due", "To-dos due today"), @("kitchen", "Kitchen orders"), @("next", "Next meeting"), @("last", "Last talk with Tyrone"))
+$script:showChoices = @(@("due", "To-dos due today"), @("kitchen", "Kitchen orders"), @("next", "Next meeting"), @("last", "Last talk with Smokey"))
 function Get-Shown { $v = Get-Setting "show"; if ($null -eq $v) { return @("due", "next") } else { return @($v.Split(",") | Where-Object { $_ }) } }
 $showItem2 = New-Object System.Windows.Forms.MenuItem("Show on the button")
 foreach ($c in $script:showChoices) {
@@ -562,7 +567,7 @@ function Step-Link {
         $ok = $true
       }
     }
-    $html = if ($ok) { "<!doctype html><meta charset=utf-8><title>Connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px;background:#0c1e36;color:#fff'><h1>Connected</h1><p>Floating Tyrone will show your day in a moment. You can close this window.</p><script>setTimeout(function(){window.close()},2500)</script>" } else { "<!doctype html><meta charset=utf-8><title>Not connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px'><h1>Not connected</h1><p>That didn't come from this connect. Choose Connect to Project Check-in from the wake listener's menu again.</p>" }
+    $html = if ($ok) { "<!doctype html><meta charset=utf-8><title>Connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px;background:#0c1e36;color:#fff'><h1>Connected</h1><p>Floating Smokey will show your day in a moment. You can close this window.</p><script>setTimeout(function(){window.close()},2500)</script>" } else { "<!doctype html><meta charset=utf-8><title>Not connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px'><h1>Not connected</h1><p>That didn't come from this connect. Choose Connect to Project Check-in from the wake listener's menu again.</p>" }
     $bytes = [Text.Encoding]::UTF8.GetBytes($html)
     $ctx.Response.ContentType = "text/html; charset=utf-8"; $ctx.Response.StatusCode = $(if ($ok) { 200 } else { 400 })
     $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length); $ctx.Response.Close()
@@ -570,7 +575,7 @@ function Step-Link {
   if ($ok) {
     $script:linkDone = Get-Date
     $script:glanceAt = [datetime]::MinValue
-    Say "Connected to Project Check-in: Floating Tyrone shows your day." Green
+    Say "Connected to Project Check-in: Floating Smokey shows your day." Green
   } else { $script:linkTask = $script:linkServer.GetContextAsync() }
 }
 # The fallback: paste a key made on the Datalink page.
@@ -643,7 +648,7 @@ function Get-GlanceDetails {
     $out += $(if ($g.nextMeeting) { $g.nextMeeting.subject + ", " + ([datetime]$g.nextMeeting.start).ToString("ddd h:mm tt") } else { "Nothing else on your calendar." })
   }
   if ($shown -contains "last") {
-    $out += "#Last talk with Tyrone"
+    $out += "#Last talk with Smokey"
     $out += $(if ($g.lastTalk) { ([datetime]$g.lastTalk.at).ToString("ddd h:mm tt") + $(if ($g.lastTalk.summary) { ": " + $g.lastTalk.summary } else { "" }) } else { "None yet." })
   }
   if (-not $out.Count) { return "#Your day`nChoose what to show: right-click > Show on the button." }
@@ -656,8 +661,9 @@ function Update-Pill {
     elseif ($script:assistantOpen -and $script:onCall) { "open", "On a call" }
     elseif ($script:assistantOpen) { "connecting", "Connecting" }
     elseif ($script:paused) { "paused", "Paused" }
-    elseif (-not $script:micName) { "problem", "No microphone" }
-    elseif (-not $script:ears) { "setup", "Starting" }
+    elseif (-not $script:micFound) { "problem", "No microphone" }   # Windows has no default recording device
+    elseif ($script:lastStartError -and -not $script:micName) { "problem", "Engine stopped" }   # a mic, but listen.py failed
+    elseif (-not $script:micName -or -not $script:ears) { "setup", "Starting" }
     else { "listening", "Sleeping" }
   $action = if ($script:setupNeeded) { "" } elseif ($script:assistantOpen) { "Stop" } else { "Start" }
   $lvl = if ($state -eq "listening") { [int]([Math]::Round([Math]::Min(100, [Math]::Max(0, $script:level)) / 10) * 10) } else { -1 }
@@ -690,9 +696,9 @@ function Step-Pill {
   Step-Hide
   Update-Pill
 }
-# Tyrone's window hides itself a few seconds after it opens (once the voice has
-# started), so only Floating Tyrone shows; he keeps talking. Click the button to
-# show it again. "Show Tyrone's window" on the menu turns the hiding off.
+# Smokey's window hides itself a few seconds after it opens (once the voice has
+# started), so only Floating Smokey shows; he keeps talking. Click the button to
+# show it again. "Show Smokey's window" on the menu turns the hiding off.
 $script:openedAt = $null; $script:keepShown = $false
 function Step-Hide {
   if (-not $script:openedAt) { return }
@@ -703,10 +709,10 @@ function Step-Hide {
     $script:assistantWindow = $w
     [WakeListenerWindows.Browser]::Hide($w)
     $script:openedAt = $null
-    Say "Tyrone's window is hidden while he talks: click Floating Tyrone to show it." DarkGray
+    Say "Smokey's window is hidden while he talks: click Floating Smokey to show it." DarkGray
   } elseif (((Get-Date) - $script:openedAt).TotalSeconds -gt 60) { $script:openedAt = $null }
 }
-$hideItem = New-Object System.Windows.Forms.MenuItem("Hide Tyrone's window while he talks")
+$hideItem = New-Object System.Windows.Forms.MenuItem("Hide Smokey's window while he talks")
 $hideItem.Checked = ((Get-Setting "hide-window") -ne "no")
 $hideItem.add_Click({ $this.Checked = -not $this.Checked; Set-Setting "hide-window" $(if ($this.Checked) { "yes" } else { "no" }) })
 
@@ -878,7 +884,7 @@ $updateItem = New-Object System.Windows.Forms.MenuItem("Check for updates")
 $updateItem.add_Click({ $script:updateNow = $true })
 $script:tray.ContextMenu.MenuItems.Add($script:tray.ContextMenu.MenuItems.Count - 2, $updateItem) | Out-Null
 
-# The version, at the top of the menu (the tray icon's and Floating Tyrone's).
+# The version, at the top of the menu (the tray icon's and Floating Smokey's).
 $versionItem = New-Object System.Windows.Forms.MenuItem("Wake listener $Version")
 $versionItem.Enabled = $false
 $script:tray.ContextMenu.MenuItems.Add(0, $versionItem) | Out-Null
@@ -887,16 +893,16 @@ $script:tray.ContextMenu.MenuItems.Add(1, (New-Object System.Windows.Forms.MenuI
 # ---- Start ------------------------------------------------------------------
 Clear-Host
 Write-Host "Wake listener $Version" -ForegroundColor White
-Write-Host "Say `"$Phrase`" and your assistant opens. A neural keyword engine listens, on this PC only."
+Write-Host "Say `"$PhraseShown`" and your assistant opens. A neural keyword engine listens, on this PC only."
 Write-Host "Opens: $Url"
-Say "Floating Tyrone shows whether he's listening. Start opens him, Stop ends the conversation; double-click it for this window, drag it anywhere, right-click for options." White
+Say "Floating Smokey shows whether he's listening. Start opens him, Stop ends the conversation; double-click it for this window, drag it anywhere, right-click for options." White
 Say "Closing this window only hides it: the listener keeps running. Quit from the menu." White
 Write-Host ""
 Set-TrayText
 $needSetup = -not (Test-Engine)
 if (-not $needSetup) {
   Say ("Sensitivity: " + $Sensitivity + ". Engine ready in " + $EngineFolder) DarkGray
-  $script:tray.ShowBalloonTip(6000, "Wake listener is on", "Say `"$Phrase`" and your assistant opens. It's listening in the tray; right-click the icon for options.", [System.Windows.Forms.ToolTipIcon]::Info)
+  $script:tray.ShowBalloonTip(6000, "Wake listener is on", "Say `"$PhraseShown`" and your assistant opens. It's listening in the tray; right-click the icon for options.", [System.Windows.Forms.ToolTipIcon]::Info)
 }
 
 $mic = $null
@@ -935,7 +941,7 @@ while (-not $script:quit) {
     if (-not $handedOver) {
       Stop-Listening
       if ($script:setupForced) { Remove-Item (Join-Path $EngineFolder "packages.txt") -ErrorAction SilentlyContinue; $script:setupForced = $false }
-      if (Install-Engine) { $needSetup = $false; Say "Listening for `"$Phrase`" now." White } else { $needSetup = $true; $nextSetupTry = (Get-Date).AddMinutes(2) }
+      if (Install-Engine) { $needSetup = $false; Say "Listening for `"$PhraseShown`" now." White } else { $needSetup = $true; $nextSetupTry = (Get-Date).AddMinutes(2) }
       $restartAt = Get-Date
     }
   }
@@ -976,6 +982,7 @@ while (-not $script:quit) {
   if ((Get-Date) -ge $nextMicCheck -or ($restartAt -and (Get-Date) -ge $restartAt)) {
     $nextMicCheck = (Get-Date).AddSeconds(3)
     $now = Get-Microphone
+    $script:micFound = [bool]$now
     if (-not $now) {
       if ($mic -or -not $script:noMicSaid) { Say "No microphone found. Plug one in or set a default in Settings > System > Sound > Input. Checking every few seconds." Yellow; $script:noMicSaid = $true }
       Stop-Listening; $mic = $null
@@ -1007,7 +1014,7 @@ while (-not $script:quit) {
       "level" { $script:level = [int]$parts[1]; $lastLevelAt = Get-Date }
       "ready" {
         Say ("Listening on: " + $parts[1]) Green
-        $script:micName = $parts[1]; Set-TrayText
+        $script:micName = $parts[1]; $script:lastStartError = $null; Set-TrayText
         $host.UI.RawUI.WindowTitle = "Wake listener: listening on " + $parts[1]
         # A Bluetooth headset's microphone is phone-call quality: say so once per microphone.
         if ($parts[1] -match "Hands-Free|Headset|Bluetooth|\bBT\b|AG Audio" -and $script:btWarned -ne $parts[1]) {
@@ -1039,11 +1046,11 @@ while (-not $script:quit) {
         Write-Heard ("Missed (you said so): " + $h[0] + "  heard " + $words)
       }
       "wake" {
-        if (((Get-Date) - $last).TotalSeconds -lt $GraceSecs) { Say "Heard `"$Phrase`": it's opening now, ignored." DarkGray }
-        elseif (Test-AssistantOpen) { Say "Heard `"$Phrase`": the assistant is already open, ignored." DarkGray }
-        elseif ($script:paused) { Say "Heard `"$Phrase`": paused, so not opening." DarkGray }
+        if (((Get-Date) - $last).TotalSeconds -lt $GraceSecs) { Say "Heard `"$PhraseShown`": it's opening now, ignored." DarkGray }
+        elseif (Test-AssistantOpen) { Say "Heard `"$PhraseShown`": the assistant is already open, ignored." DarkGray }
+        elseif ($script:paused) { Say "Heard `"$PhraseShown`": paused, so not opening." DarkGray }
         else {
-          Say "Heard `"$Phrase`": opening the assistant." Cyan
+          Say "Heard `"$PhraseShown`": opening the assistant." Cyan
           $script:lastHeard = (Get-Date -Format "HH:mm") + " opened"; Set-TrayText
           $last = Get-Date
           # Let go of the microphone first, so the assistant gets it cleanly.

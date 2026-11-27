@@ -50,12 +50,13 @@ SENSITIVITY = {"low": (0.12, 2.0), "normal": (0.06, 3.0), "high": (0.03, 4.0)}
 ALONE = {"low": (0.2, 1.5), "normal": (0.1, 2.0), "high": (0.05, 3.0)}
 # How close a heard word must be to the name, by sensitivity.
 CLOSENESS = {"low": 0.82, "normal": 0.75, "high": 0.68}
-# The trained detector: openWakeWord's front end (in the engine folder) and our "hey Tyrone" network (next to this file).
+# The trained detectors: openWakeWord's front end (in the engine folder) and a network per name (next to this file).
 HERE = os.path.dirname(os.path.abspath(__file__))
-DETECTOR = ("melspectrogram.onnx", "embedding_model.onnx", "hey_tyrone.onnx")
+DETECTOR = ("melspectrogram.onnx", "embedding_model.onnx", ("hey_smokey.onnx", "hey_tyrone.onnx"))  # a network per name; any found
 # The score at which it asks for the second check, by sensitivity. It never wakes on its own: a high score on
 # "my brother Tyrone" or "hey Tyler" is common, so the words have to be a greeting and the name too.
 DETECTOR_LEVELS = {"low": 0.7, "normal": 0.5, "high": 0.3}
+DETECTOR_SURE = 0.97  # with the sure spotter, enough to stand in for words that came out empty
 
 
 def say(*parts):
@@ -100,12 +101,22 @@ GREETINGS = {"hey", "hi", "hay", "hei", "heyy", "hai", "eh", "ay", "okay", "ok",
              "k", "high", "hate", "i", "h", "d", "t", "p", "de", "te", "dee", "eight"}
 
 
+CLEAR_GREETINGS = {"hey", "hi", "hay", "hei", "heyy", "hai", "okay", "ok", "yo", "hello"}
+
+
+def phrases(phrase):
+    """The wake phrases: "hey Smokey|hey Tyrone" is either one."""
+    return [p.strip() for p in phrase.split("|") if p.strip()]
+
+
 def spellings(name):
     """Ways the spotter might spell how the name sounds (it knows word pieces, not names)."""
     n = name.upper()
     out = [n]
     if n == "TYRONE":
         out += ["TY RONE", "TIE RONE", "TYRON", "TY RON", "TIE RON", "TIRONE"]
+    if n in ("SMOKEY", "SMOKY"):
+        out = ["SMOKEY", "SMOKY", "SMO KEY", "SMOKIE", "SMOKE E"]
     return out
 
 
@@ -113,15 +124,16 @@ def keywords(folder, file, phrase, threshold, boost, alikes):
     """The phrase in the spotter's word pieces (with sound-alikes when asked), as a keywords file."""
     import sentencepiece as spm
     sp = spm.SentencePieceProcessor(model_file=os.path.join(folder, KWS, "bpe.model"))
-    words = phrase.upper().replace(",", " ").split()
-    greet, name = (words[:-1], words[-1]) if len(words) > 1 else ([], words[0])
-    greets = [" ".join(greet)] if greet else [""]
-    if greet == ["HEY"]:
-        greets.append("HI")
     lines = set()
-    for g in greets:
-        for n in (spellings(name) if alikes else [name]):
-            lines.add(" ".join(sp.encode((g + " " + n).strip(), out_type=str)) + f" :{boost} #{threshold} @WAKE")
+    for one in phrases(phrase):
+        words = one.upper().replace(",", " ").split()
+        greet, name = (words[:-1], words[-1]) if len(words) > 1 else ([], words[0])
+        greets = [" ".join(greet)] if greet else [""]
+        if greet == ["HEY"]:
+            greets.append("HI")
+        for g in greets:
+            for n in (spellings(name) if alikes else [name]):
+                lines.add(" ".join(sp.encode((g + " " + n).strip(), out_type=str)) + f" :{boost} #{threshold} @{name}")
     path = os.path.join(folder, file)
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(sorted(lines)) + "\n")
@@ -152,6 +164,10 @@ def name_score(text, phrase, loose=False):
     together ("it" + "Tyrone" isn't the name). Loose (the spotter fired too): the greeting may be a word further back
     or run into the name.""" 
     name = squash(phrase.split()[-1])
+    rules = NAME_RULES.get(name, {})
+    shaped = (lambda k: re.match(rules["shape"], k) is not None) if "shape" in rules else (lambda k: True)
+    gap = 2 if loose and rules.get("gap", True) else 1
+    shortest = max(4, len(name) - 1)  # "smok" (smoke) isn't "smokey"; "tyron" still allows four
     text = re.sub(r"'s(?![a-z])", "", text.lower()).replace("-", " ").replace("8", " eight ")  # "8 iron": "hey Tyrone"
     words = re.findall(r"[a-z]+", text)
     best, greeted, first, merged = 0.0, False, False, 0.0
@@ -161,21 +177,30 @@ def name_score(text, phrase, loose=False):
             if len(part) < j or (j > 1 and (all(w in COMMON for w in part) or (not loose and min(map(len, part)) < 3))):
                 continue
             key = squash("".join(part))
-            before = words[max(0, i - (2 if loose else 1)):i]
+            before = words[max(0, i - gap):i]
             cands = []
-            if 4 <= len(key) <= len(name) + 2 and words[i] not in GREETINGS:
-                cands.append((key, any(w in GREETINGS for w in before)))
+            if shortest <= len(key) <= len(name) + 2 and words[i] not in GREETINGS and shaped(key):
+                # "smoking" for Smokey needs a plain greeting ("hey smoking"), not "he's smoking".
+                cands.append((key, any(w in (CLEAR_GREETINGS if key.endswith("yng") else GREETINGS) for w in before)))
             # The greeting heard as a sound stuck to the front of the name: "Detyrone", "Tetyrone", "Kt-iro".
             lead = re.match(r"^[hktdpb][aeouy]{0,2}(?=ty)", key)
-            if lead and (i == 0 or words[i - 1] in GREETINGS) and 4 <= len(key) - lead.end() <= len(name) + 2:
+            if lead and (i == 0 or words[i - 1] in GREETINGS) and shortest <= len(key) - lead.end() <= len(name) + 2 and shaped(key[lead.end():]):
                 cands.append((key[lead.end():], True))
             for k, g in cands:
-                r = difflib.SequenceMatcher(None, k, name).ratio()
+                r = 1.0 if "shape" in rules else difflib.SequenceMatcher(None, k, name).ratio()  # shaped: it is the name
                 if r > best or (r == best and g and not greeted):
                     best, greeted, first = r, g, i == 0
-            if loose and key[:1] in ("h", "k") and 4 <= len(key) - 1 <= len(name) + 2:  # "hyron", "ktaron", "h i rohn"
-                merged = max(merged, difflib.SequenceMatcher(None, key[1:], name).ratio())
+            if loose and key[:1] in ("h", "k") and shortest <= len(key) - 1 <= len(name) + 2 and shaped(key[1:]):  # "hyron", "ktaron", "h i rohn"
+                merged = max(merged, 1.0 if "shape" in rules else difflib.SequenceMatcher(None, key[1:], name).ratio())
     return best, greeted, first, merged
+
+
+# Names that are everyday words, or close to them ("Smoky Mountains", "hey Mikey", "hey Pokey"): the words must
+# match more closely (speech-to-text writes "Smoky", "Smokie": 0.91), and the name alone at the start never counts.
+# "shape": the sound key must look like the name (smoky, smokey, smokie; not monkey, smokes, slow key, smoking).
+# "gap": False means the greeting must be right before the name even when a spotter fired ("hey, it's Smokey's turn").
+# Speech-to-text often writes "hey Smokey" as "hey smoking", so that counts too (only right after the greeting).
+NAME_RULES = {"smokey": {"floor": 0.8, "bare": False, "shape": r"^smok(e?y|yng?)$", "gap": False}}
 
 
 def verdict(text, phrase, closeness, spotted, bare=True):
@@ -183,16 +208,23 @@ def verdict(text, phrase, closeness, spotted, bare=True):
 
     spotted: a spotter or the detector fired too, so less evidence is needed from the words.
     bare: the name alone at the start counts (the spotters heard "hey" that the words lost). Not for the detector,
-    which also scores high on "Tyrone's report is late"."""
+    which also scores high on "Tyrone's report is late".
+    With several phrases ("hey Smokey|hey Tyrone"), the best verdict of any."""
+    if "|" in phrase:
+        rank = {"yes": 2, "close": 1, None: 0}
+        return max((verdict(text, p, closeness, spotted, bare) for p in phrases(phrase)), key=lambda v: rank[v])
+    rules = NAME_RULES.get(squash(phrase.split()[-1]), {})
+    floor = rules.get("floor", 0.0)
+    bare = bare and rules.get("bare", True)
     best, greeted, first, merged = name_score(text, phrase)
-    if best >= closeness and greeted:
+    if best >= max(closeness, floor) and greeted:
         return "yes"
     if spotted and not bare:  # the detector: the greeting right before the name, as heard ("hey, it's Tyrone's" isn't)
-        if max(best if greeted else 0, merged) >= closeness - 0.05:
+        if max(best if greeted else 0, merged) >= max(closeness - 0.05, floor):
             return "yes"
     elif spotted:
         best, greeted, first, merged = name_score(text, phrase, loose=True)
-        if max(best if (greeted or first) else 0, merged) >= closeness - 0.05:
+        if max(best if (greeted or (first and bare)) else 0, merged) >= max(closeness - 0.05, floor):
             return "yes"
     return "close" if max(best, merged) >= closeness - 0.15 else None
 
@@ -228,8 +260,9 @@ def to16k(x, rate):
 
 
 class Detector:
-    """The trained "hey Tyrone" detector (openWakeWord style): a mel spectrogram and Google's speech embedding (both
-    frozen), then a small network trained on thousands of synthetic voices. Every 80 ms it gives a score from 0 to 1."""
+    """The trained detectors (openWakeWord style): a mel spectrogram and Google's speech embedding (both frozen, shared),
+    then a small network per name ("hey Smokey", "hey Tyrone") trained on thousands of synthetic voices. Every 80 ms
+    it gives the best score of any network, from 0 to 1."""
 
     def __init__(self, folder):
         import numpy as np
@@ -240,8 +273,9 @@ class Detector:
         run = lambda path: ort.InferenceSession(path, o, providers=["CPUExecutionProvider"])
         self.np = np
         self.mel, self.emb = run(os.path.join(folder, DETECTOR[0])), run(os.path.join(folder, DETECTOR[1]))
-        self.net = run(os.path.join(HERE, DETECTOR[2]))
-        self.net_in = self.net.get_inputs()[0].name
+        self.nets = [run(os.path.join(HERE, f)) for f in DETECTOR[2] if os.path.exists(os.path.join(HERE, f))]
+        if not self.nets:
+            raise FileNotFoundError("no detector network next to listen.py")
         self.reset()
 
     def reset(self):
@@ -272,7 +306,8 @@ class Detector:
             self.embs[-1] = e
             self.count += 1
             if self.count >= 16:
-                best = max(best, float(self.net.run(None, {self.net_in: self.embs[None]})[0].reshape(-1)[0]))
+                for net in self.nets:
+                    best = max(best, float(net.run(None, {net.get_inputs()[0].name: self.embs[None]})[0].reshape(-1)[0]))
         return best
 
 
@@ -305,7 +340,7 @@ class Ears:
         self.sure = spotter("keywords.txt", ALONE, False)
         self.raw = np.zeros(RATE * 8, np.float32)  # the last 8 seconds as the microphone gave them, for "it missed me"
         self.det, self.det_level = None, DETECTOR_LEVELS.get(sensitivity, DETECTOR_LEVELS["normal"])
-        if self.check and "--no-detector" not in sys.argv and all(os.path.exists(p) for p in (os.path.join(folder, DETECTOR[0]), os.path.join(folder, DETECTOR[1]), os.path.join(HERE, DETECTOR[2]))):
+        if self.check and "--no-detector" not in sys.argv and all(os.path.exists(os.path.join(folder, f)) for f in DETECTOR[:2])                 and any(os.path.exists(os.path.join(HERE, f)) for f in DETECTOR[2]):
             try:
                 self.det = Detector(folder)
             except Exception as e:  # noqa: BLE001 - the spotters still work without it
@@ -342,7 +377,7 @@ class Ears:
             self.vad.reset()
             self.ring[:] = 0
             self.vad_left = self.np.zeros(0, self.np.float32)
-            self.pending, self.pending_how = None, None  # when a spotter fired: check once a little more has been heard
+            self.pending, self.pending_how, self.pending_lenient, self.pending_det = None, None, False, 0.0  # when a spotter fired: check once a little more has been heard
 
     def words(self, x):
         """The words in some sound. Long silence either side is trimmed first: the model tends to hear nothing at all
@@ -363,8 +398,17 @@ class Ears:
         """Runs the check on some sound; True when it's the phrase."""
         text = self.words(x)
         v = verdict(text, self.phrase, self.closeness, how != "speech", how != "detector")
-        # The spotter set as before 6.5 is overruled only when the words are plainly something else.
-        if v == "yes" or (how == "sure" and (v == "close" or len(re.findall(r"[a-z]+", text.lower())) < 2)):
+        # The spotter set as before 6.5 is overruled only when the words are plainly something else. A near miss
+        # counts only for a name that isn't an everyday word (Tyrone, not "the Smoky Mountains").
+        lenient = how == "sure" and getattr(self, "pending_lenient", True)
+        if v == "close" and lenient:
+            plain = "|".join(p for p in phrases(self.phrase) if squash(p.split()[-1]) not in NAME_RULES)
+            v = verdict(text, plain, self.closeness, True) if plain else None
+        few = len(re.findall(r"[a-z]+", text.lower())) < 2
+        # Smokey: the sure spotter and the trained detector both heard it and the words came out empty (far off,
+        # over music): two separate hearings stand in for the words.
+        both = how == "sure" and few and getattr(self, "pending_det", 0.0) >= DETECTOR_SURE
+        if v == "yes" or both or (lenient and (v == "close" or few)):
             say("heard", "yes", how, text)
             return True
         if v == "close" or how != "speech":
@@ -373,13 +417,15 @@ class Ears:
 
     @staticmethod
     def fired(kws, stream, x):
+        """Feeds the spotter; returns the names it heard (its keyword tags, such as "SMOKEY"), empty when none."""
         stream.accept_waveform(RATE, x)
-        hit = False
+        hit = set()
         while kws.is_ready(stream):
             kws.decode_stream(stream)
-            if kws.get_result(stream):
+            r = kws.get_result(stream)
+            if r:
                 kws.reset_stream(stream)
-                hit = True
+                hit.add(r.strip().lstrip("@").upper())
         return hit
 
     @staticmethod
@@ -417,20 +463,28 @@ class Ears:
         x_raw, x = x, self.level(x)
         self.heard += len(x)
         score = self.det.feed(x_raw) if self.det else 0.0
-        sure = self.fired(self.sure, self.sure_stream, x)
+        sure_names = self.fired(self.sure, self.sure_stream, x)
+        sure = bool(sure_names)
+        # The sure spotter's allowance (it opens unless the words are plainly something else) is only for a name
+        # that isn't an everyday word: for Smokey the words must check out.
+        lenient = any(squash(n) not in NAME_RULES for n in sure_names)
         if not self.check:
             if sure:
                 say("heard", "yes", "sure", "")
             return self.wake(sure)
         woke = False
         self.keep(self.ring, x)
-        spotted = self.fired(self.maybe, self.maybe_stream, x)
+        spotted = bool(self.fired(self.maybe, self.maybe_stream, x))
         how = "sure" if sure else "spotter" if spotted else "detector" if score >= self.det_level else None
         rank = {"sure": 3, "spotter": 2, "detector": 1}
         if how and self.pending is None:
-            self.pending, self.pending_how = self.heard + int(RATE * 0.5), how
+            self.pending, self.pending_how, self.pending_lenient, self.pending_det = self.heard + int(RATE * 0.5), how, lenient, 0.0
         elif how and rank[how] > rank[self.pending_how]:
             self.pending_how = how
+        if how and self.pending is not None:
+            self.pending_lenient = self.pending_lenient or lenient
+        if self.pending is not None:
+            self.pending_det = max(self.pending_det, score)
         # A spotter fired a moment ago: check the 3 seconds around it.
         if self.pending is not None and self.heard >= self.pending:
             at, self.pending = self.pending, None
@@ -472,7 +526,7 @@ def listen(folder, phrase, sensitivity, wav=None):
     def hear(samples, rate):
         peak[0] = max(peak[0], float(np.abs(samples).max()) if len(samples) else 0.0)
         if ears.feed(to16k(samples, rate)):
-            say("wake", phrase)
+            say("wake", phrases(phrase)[0])
 
     flag = os.path.join(folder, "missed.flag")
 

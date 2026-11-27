@@ -9,7 +9,7 @@ using System.Windows.Forms;
 
 namespace WakeUi {
   /// <summary>
-  /// The floating Tyrone button: a rounded pill drawn into a per-pixel-alpha
+  /// The floating Smokey button: a rounded pill drawn into a per-pixel-alpha
   /// (layered) window, so its edges are smooth and it never flickers. It only
   /// redraws when what it shows changes. What you do with it comes out as
   /// events: "start", "stop", "front", "activity", "menu", "moved|x,y",
@@ -17,7 +17,7 @@ namespace WakeUi {
   /// </summary>
   public class Pill : Form {
     public readonly ConcurrentQueue<string> Clicks = new ConcurrentQueue<string>();
-    string title = "Tyrone", status = "Starting", info = "", action = "", details = "";
+    string title = "Smokey", status = "Starting", info = "", action = "", details = "";
     /// <summary>Showing the larger view: each detail on its own line.</summary>
     public bool Expanded;
     Color dot = Color.FromArgb(251, 191, 36);

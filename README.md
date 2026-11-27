@@ -1,28 +1,28 @@
 # Wake listener
 
-Say **"hey Tyrone"** and your Project Check-in assistant opens and starts talking.
+Say **"hey Smokey"** and your Project Check-in assistant opens and starts talking. ("hey Tyrone", the assistant's old name, still works for a few weeks, since 6.7.)
 
-Since 6.5 it listens in **two stages, the way smart speakers do**. A small keyword spotter ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)) catches anything like the phrase, a voice detector passes on every short burst of speech, and since 6.6 a detector trained on "hey Tyrone" itself listens too. A speech-to-text model ([Moonshine](https://github.com/moonshine-ai/moonshine)) then checks the words before Tyrone opens. It runs on your PC; nothing is sent anywhere.
+Since 6.5 it listens in **two stages, the way smart speakers do**. A small keyword spotter ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)) catches anything like the phrase, a voice detector passes on every short burst of speech, and since 6.6 detectors trained on the phrases themselves listen too. A speech-to-text model ([Moonshine](https://github.com/moonshine-ai/moonshine)) then checks the words before Smokey opens. It runs on your PC; nothing is sent anywhere.
 
 ## Install
 
-1. Download the latest version from **[Releases](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest)**: the file named with its version, such as `WakeListener-6.6.0.zip` (`WakeListener.zip` there is the same file). Right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
+1. Download the latest version from **[Releases](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest)**: the file named with its version, such as `WakeListener-6.7.0.zip` (`WakeListener.zip` there is the same file). Right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
 2. Double-click **Start wake listener.cmd**. (If Windows asks about running it, choose **Run**.)
 3. **First run: it sets up the engine** (a few minutes, once, needs the internet). The activity window shows each step:
    - Python: it uses yours (3.11 to 3.14), or installs Python 3.12 from python.org for your Windows account only, through winget;
    - its own Python environment and the engine's packages (sherpa-onnx, sounddevice, numpy, sentencepiece, onnxruntime), in `%LOCALAPPDATA%\WakeListener`;
    - three models from sherpa-onnx's releases (the 17 MB keyword spotter, the 106 MB speech-to-text check and a 0.2 MB voice detector) and two from openWakeWord's (2.4 MB, the trained detector's front end), each checked against its SHA-256 before it's used. Updating downloads whatever's new once.
-4. Say **"hey Tyrone"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
+4. Say **"hey Smokey"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
 
-**Floating Tyrone** stays on top of every window, above the clock to start with:
-- a dot and a word say how Tyrone is: green **Sleeping** (waiting for "hey Tyrone", with a small bar that moves with your voice), blue **On a call** (only while a conversation is actually connected), light blue **Connecting**, grey **Paused**, amber **Setting up**, red **No microphone**;
+**Floating Smokey** stays on top of every window, above the clock to start with:
+- a dot and a word say how Smokey is: green **Sleeping** (waiting for "hey Smokey", with a small bar that moves with your voice), blue **On a call** (only while a conversation is actually connected), light blue **Connecting**, grey **Paused**, amber **Setting up**, red **No microphone** (Windows has no recording device: it picks one up within a few seconds of it appearing), red **Engine stopped** (there's a microphone, but the listening engine failed: the activity window says why, and it keeps retrying);
 - **the arrow** next to Start/Stop opens a **larger view**: each item you chose under its own heading, in full (today's to-dos with the late ones marked, your Kitchen orders, your next meeting with its time, your last talk with what was done). Click it again to go back to the small button; it remembers which you like;
-- **Start** opens Tyrone; **Stop** ends the conversation the same way End discussion does, so it's saved (the page ends it on Escape);
-- under it, what you choose from **Show on the button**: to-dos due today, Kitchen orders, your next meeting, your last talk with Tyrone. The first time, **click the button** (or right-click > Show on the button > Connect to Project Check-in): a Project Check-in page opens, you press **Connect**, and it hands the listener a key on this PC. The key is kept encrypted for your Windows account only, and you can revoke it on the Datalink page. (Or paste a key yourself: right-click > Show on the button > Paste a key instead.);
-- **Tyrone's window hides itself** a few seconds after he starts talking, so only Floating Tyrone shows and he keeps going. **Click** the button to show his window, click again to hide it. Turn the hiding off with "Hide Tyrone's window while he talks" on the menu. (Closing his window with its X still ends the conversation: use Stop, or just leave it hidden.);
+- **Start** opens Smokey; **Stop** ends the conversation the same way End discussion does, so it's saved (the page ends it on Escape);
+- under it, what you choose from **Show on the button**: to-dos due today, Kitchen orders, your next meeting, your last talk with Smokey. The first time, **click the button** (or right-click > Show on the button > Connect to Project Check-in): a Project Check-in page opens, you press **Connect**, and it hands the listener a key on this PC. The key is kept encrypted for your Windows account only, and you can revoke it on the Datalink page. (Or paste a key yourself: right-click > Show on the button > Paste a key instead.);
+- **Smokey's window hides itself** a few seconds after he starts talking, so only Floating Smokey shows and he keeps going. **Click** the button to show his window, click again to hide it. Turn the hiding off with "Hide Smokey's window while he talks" on the menu. (Closing his window with its X still ends the conversation: use Stop, or just leave it hidden.);
 - **double-click** it for the activity window, **drag** it anywhere (it remembers where), **right-click** it for the menu.
 
-The **activity window** (what it's doing, with a live mic meter) is hidden until you double-click Floating Tyrone or choose it from the menu. Closing it only hides it; the listener keeps running.
+The **activity window** (what it's doing, with a live mic meter) is hidden until you double-click Floating Smokey or choose it from the menu. Closing it only hides it; the listener keeps running.
 
 It also runs as a **tray icon** by the clock. Hover it to see the microphone and the last time it opened. Right-click it (or the floating button) to:
 - show the activity window (microphone, live level meter, and each time it hears the phrase),
@@ -51,7 +51,7 @@ While the assistant is open it lets go of the microphone, and takes it back when
 - **Use the microphone over USB, not Bluetooth, if it has both.** While a Bluetooth headset or speakerphone has its mic on, it sends narrowband, phone-call-quality sound, which loses much of what the engine listens for. Over USB it sends full-quality sound. The activity window says so when the microphone looks like Bluetooth.
 - **It misses you:** right after, choose **He missed me just now** from the menu. Then set the sensitivity to **High** if it keeps happening.
 - **It opens on other talk:** set it to **Low**.
-- Say it the way you'd say "Alexa": "hey Tyrone", then a short pause.
+- Say it the way you'd say "Alexa": "hey Smokey", then a short pause.
 
 ## Settings
 
@@ -69,7 +69,7 @@ Quit from the tray and start it again after a change.
 powershell -ExecutionPolicy Bypass -File WakeListener.ps1 -Test
 ```
 
-Windows' own voices say "hey Tyrone" at different speeds, some over loud music, and other things that come close ("Tyrone called about the permit", "my brother Tyrone", "hey there Ron", "hey Tony", "high tone"). Each recording goes through the engine the way the microphone's sound does: the phrase must open, the others mustn't. The engine has to be set up first, by starting the listener once.
+Windows' own voices say "hey Smokey" and "hey Tyrone" at different speeds, some over loud music, and other things that come close ("we drove through the Smoky Mountains", "Smokey is the Tennessee mascot", "the smoke detector is beeping", "hey Mikey", "Tyrone called about the permit", "my brother Tyrone", "hey there Ron", "hey Tony", "high tone"). Each recording goes through the engine the way the microphone's sound does: the phrase must open, the others mustn't. The engine has to be set up first, by starting the listener once.
 
 How each version compares, on 81 "hey Tyrone" recordings and 420 near misses (three Windows voices, three speeds, sound made to match each room):
 
@@ -82,7 +82,20 @@ How each version compares, on 81 "hey Tyrone" recordings and 420 near misses (th
 | Across a room, with music | 26% | 60% | 78% | 4 / 4 / 5 |
 | Another room | 4% | 21% | 23% | 1 / 2 / 2 |
 
-The false opens all come from the 240 deliberately close phrases ("hey Tyrion", "hey, tie the rope", "hey Cairo"). None came from the 180 everyday ones.
+The false opens all come from the 240 deliberately close phrases ("hey Tyrion", "hey, tie the rope", "hey Cairo"). None came from the 180 everyday ones. 6.7 listens for both names and scores the same on "hey Tyrone".
+
+"Hey Smokey" in 6.7, on the same kind of test (81 recordings; 180 everyday phrases, including "we drove through the Smoky Mountains", "Smokey is the Tennessee mascot" and "the smoke detector is beeping"; 240 deliberately close ones such as "hey Spooky", "hey, smoke it", "hey Monkey", "hey, it's Smokey's turn"):
+
+| Sound | Caught | False opens (everyday / close) |
+|---|---|---|
+| Close to the mic | 98% | 0 / 0 |
+| Bluetooth (phone quality) | 90% | 0 / 5 |
+| Across a room | 68% | 0 / 7 |
+| Over music | 98% | 0 / 6 |
+| Across a room, with music | 63% | 0 / 10 |
+| Another room | 27% | 1 / 2 |
+
+"Smokey" is nearly an everyday word, so it's held to stricter rules than "Tyrone": the words must say "hey" (or "hi", "hello", "okay") right before it, spelled like the name ("Smoky", "Smokie", and "smoking", which speech-to-text often writes for it), and the name alone at the start of a sentence never counts. That keeps "the Smoky Mountains" and the mascot quiet, at the cost of fewer catches across a room than "hey Tyrone".
 
 ## How it works
 
@@ -90,12 +103,12 @@ The false opens all come from the 240 deliberately close phrases ("hey Tyrion", 
 - `listen.py` reads the microphone (sounddevice) and evens out the level (slow automatic gain, so quiet or far-off talk is brought up). Three things listen to it:
   - **the spotter as before 6.5** (sherpa-onnx keyword spotting on the phrase's own spelling): opens unless the check's words are plainly something else;
   - **the spotter set loose**, with sound-alike spellings of the name ("tie rone", "ty ron"): opens if the check's words have the name (or near it) at the start;
-  - **the trained detector** (6.6, below): when it scores the sound as "hey Tyrone", the check runs, and opens only if the words hold a greeting right before the name ("Tyrone's report is late" and "hey, it's Tyrone's turn" don't);
+  - **the trained detectors** (6.6, below; one per name since 6.7): when one scores the sound as its phrase, the check runs, and opens only if the words hold a greeting right before the name ("Tyrone's report is late" and "hey, it's Tyrone's turn" don't);
   - **the voice detector** (Silero): every short burst of speech is checked, and opens only if the words clearly hold "hey" or "hi" right before the name. This catches the times the spotter misses.
 - **The check** is Moonshine's base English model: it turns the last couple of seconds into words in about 40 ms. Names come out spelled many ways ("Tyron", "Detyrone", "Hey, chiron"), so the words are compared by a rough sound key, and everyday words run together ("try one") don't count.
 - The sensitivity sets how loose the spotters are, how high the trained detector must score and how close the words must be.
 
-**The trained detector** (`hey_tyrone.onnx`, 0.9 MB, shipped with it) is built the [openWakeWord](https://github.com/dscripka/openWakeWord) way: a mel spectrogram and Google's speech embedding model (`melspectrogram.onnx`, `embedding_model.onnx`, both frozen, downloaded at setup from openWakeWord's v0.5.1 release rather than kept here), then a small network trained here on about 20,000 synthetic "hey Tyrone"s (1,000+ voices from Piper and Kokoro, in made-up rooms, over noise and music, at Bluetooth quality) against 95 hours of LibriSpeech audiobook speech (CC BY 4.0) and 12,000 near misses. On 4.7 hours of held-out speech it scores high about once an hour on its own, which is why it never opens without the check. It's what lifts "across a room, with music" from 60% to 78%. Every 80 ms it costs a few milliseconds of CPU.
+**The trained detectors** (`hey_smokey.onnx` and `hey_tyrone.onnx`, 0.9 MB each, shipped with it) is built the [openWakeWord](https://github.com/dscripka/openWakeWord) way: a mel spectrogram and Google's speech embedding model (`melspectrogram.onnx`, `embedding_model.onnx`, both frozen, downloaded at setup from openWakeWord's v0.5.1 release rather than kept here), then a small network per name, each trained here on about 20,000 synthetic "hey Smokey"s or "hey Tyrone"s (1,000+ voices from Piper and Kokoro, in made-up rooms, over noise and music, at Bluetooth quality) against 95 hours of LibriSpeech audiobook speech (CC BY 4.0) and 12,000 near misses. On 4.7 hours of held-out speech it scores high about once an hour on its own, which is why it never opens without the check. It's what lifts "across a room, with music" from 60% to 78%. Every 80 ms it costs a few milliseconds of CPU.
 
 Earlier versions:
 - **6.0 to 6.4** used the keyword spotter alone. Good up close, but it missed most of the time across a room or over music.
