@@ -1,29 +1,29 @@
-﻿# Thread driver: Tyrone types into your real Claude Code threads.
+﻿# Thread driver: Smokey types into your real Claude Code threads.
 #
 # Run it on the PC where the Claude desktop app runs your threads, next to the
-# Claude relay (it uses the relay's key). When you tell Tyrone "tell the
+# Claude relay (it uses the relay's key). When you tell Smokey "tell the
 # project-checkin thread to run the tests again", this opens that thread in
 # the Claude app, pastes the message into its box and presses Enter, exactly
 # as if you'd typed it. The thread works with its own settings and shows in the
 # app and on your phone (Remote Control). When the thread finishes its turn,
-# its answer goes back to Tyrone and your chat.
+# its answer goes back to Smokey and your chat.
 #
 # What it won't do: type into a thread that's busy (it waits), type while the
 # PC is locked (it waits), overwrite something you've half-typed in that
 # thread's box (it waits), or click anything else. It never answers a
-# permission prompt: when a thread stops to ask, Tyrone tells you, and you
+# permission prompt: when a thread stops to ask, Smokey tells you, and you
 # approve it yourself, on the PC or your phone.
 #
 #   ThreadDriver.ps1 -Doctor                 checks it can see the Claude app and the relay's key
 #   ThreadDriver.ps1 -Type <thread id> "msg" types one message into a thread now (a test), and waits for the answer
-#   ThreadDriver.ps1 -List                   sends Tyrone the list of your threads once
+#   ThreadDriver.ps1 -List                   sends Smokey the list of your threads once
 #   ThreadDriver.ps1 -Install                starts it hidden at every sign-in (a scheduled task), and now
 #   ThreadDriver.ps1 -Uninstall              stops it and removes the scheduled task
 #   ThreadDriver.ps1                         runs in this window, checking every 10 seconds
 param([switch]$Doctor, [switch]$List, [string]$Type, [string]$Message, [switch]$Install, [switch]$Uninstall, [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "1.2.1"
+$Version = "1.2.2"
 $Folder = Join-Path $env:LOCALAPPDATA "ThreadDriver"
 $RelayKey = Join-Path $env:LOCALAPPDATA "ClaudeRelay\key.txt"
 $LogFile = Join-Path $Folder "driver.log"
@@ -72,7 +72,7 @@ function Get-Session([string]$id) {
   if (-not $f) { return $null }
   return Read-Json $f.FullName
 }
-# Every thread on this PC that isn't archived (whatever its age), so Tyrone can be told to type into any of them.
+# Every thread on this PC that isn't archived (whatever its age), so Smokey can be told to type into any of them.
 function Send-Directory([string]$key) {
   $roots = @(Get-ChildItem -Path "$env:LOCALAPPDATA\Claude-Data\*\claude-code-sessions", "$env:APPDATA\Claude\claude-code-sessions" -Directory -ErrorAction SilentlyContinue)
   $epoch = New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
@@ -144,7 +144,7 @@ function Box-Text($box) {
   return ""
 }
 
-# Types one message into a thread, then puts back the window that was in front (Tyrone, say), so you're
+# Types one message into a thread, then puts back the window that was in front (Smokey, say), so you're
 # returned to where you were. Returns $null when it went in, or why it didn't (and whether to try again later).
 function Type-Into([string]$threadId, [string]$text) {
   $prev = [Win]::GetForegroundWindow()
@@ -274,7 +274,7 @@ if ($Doctor) {
 if ($List) {
   $key = Get-Key
   if (-not $key) { Write-Host "Connect the Claude relay first: ClaudeRelay.ps1 -Connect" -ForegroundColor Yellow; exit 1 }
-  Write-Host "Sent Tyrone the list of $(Send-Directory $key) threads."
+  Write-Host "Sent Smokey the list of $(Send-Directory $key) threads."
   exit 0
 }
 
@@ -297,7 +297,7 @@ if ($Install) {
   # A copy already running (an older version) is stopped, so the new one takes over.
   if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }
   Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'ThreadDriver\.ps1' -and $_.ProcessId -ne $PID } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Types Tyrone's messages into your Claude Code threads (Project Check-in). $self" -Force | Out-Null
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Types Smokey's messages into your Claude Code threads (Project Check-in). $self" -Force | Out-Null
   Start-ScheduledTask -TaskName $TaskName
   Log "Installed: starts at sign-in, running now."
   exit 0
@@ -315,7 +315,7 @@ $last = ""; $nextList = Get-Date
 while ($true) {
   $key = Get-Key
   if ($key -and (Get-Date) -ge $nextList) {
-    try { $n = Send-Directory $key; if ($n -ne $script:listed) { Log "Sent Tyrone the list of $n threads."; $script:listed = $n } } catch { Log ("Thread list not sent: " + $_.Exception.Message) }
+    try { $n = Send-Directory $key; if ($n -ne $script:listed) { Log "Sent Smokey the list of $n threads."; $script:listed = $n } } catch { Log ("Thread list not sent: " + $_.Exception.Message) }
     $nextList = (Get-Date).AddMinutes(2)
   }
   $note = if (-not $key) { "Not connected: run ClaudeRelay.ps1 -Connect" } else { try { Check $key; "" } catch { "Not checked: " + $_.Exception.Message } }

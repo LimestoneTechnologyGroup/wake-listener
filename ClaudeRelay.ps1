@@ -1,4 +1,4 @@
-﻿# Claude relay: Tyrone and your Claude Code threads.
+﻿# Claude relay: Smokey and your Claude Code threads.
 #
 # Run it on the PC where the Claude desktop app runs your Claude Code threads
 # (not necessarily the one with the wake listener). It does two things:
@@ -7,21 +7,21 @@
 #    (each thread's name, folder, whether it's working or done, its last report,
 #    anything it needs from you) and sends that list to Project Check-in with its
 #    own key, so "what's going on in my threads?" gets an answer.
-# 2. Every Claude Code job Tyrone sends goes to one Tyrone thread: a Claude
+# 2. Every Claude Code job Smokey sends goes to one Smokey thread: a Claude
 #    Code session on this PC, picked up again for each job (one at a time), so
 #    it remembers what came before. It works in its own folder, outside your
 #    projects, and only dispatches: every change, however small, goes to a
 #    subthread (up to 5 run at once), each in its own git worktree of one
-#    project, on its own branch (tyrone/...), committed by the relay when it
+#    project, on its own branch (smokey/...; tyrone/... before 4.3), committed by the relay when it
 #    finishes and then closed. Nothing ever lands on the branch you work on.
 #    File edits are allowed; any command your project hasn't allowed is
-#    refused. Results go back to Tyrone and your chat. Claude Code here needs
+#    refused. Results go back to Smokey and your chat. Claude Code here needs
 #    signing in once: see -Doctor.
 #    Going live (3.3.0): when a subthread's checks pass in a project with
 #    go-live steps below ($GoLive), the relay itself (not Claude) merges its
 #    branch into main, runs the checks again on the merged code, pushes main
-#    and dev, and deploys, posting each step to your Tyrone chat and Talk.
-# 3. While anything runs, every few seconds it sends what the Tyrone thread and
+#    and dev, and deploys, posting each step to your Smokey chat and Talk.
+# 3. While anything runs, every few seconds it sends what the Smokey thread and
 #    each subthread are doing, step by step (reading a file, editing one,
 #    running the tests), so Talk shows it live.
 #
@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [switch]$Branches, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "4.2.2"
+$Version = "4.3.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -51,9 +51,25 @@ $JobsDir = Join-Path $Folder "jobs"
 $SubDir = Join-Path $Folder "subthreads"
 $SpawnDir = Join-Path $Folder "spawn"
 $WtDir = Join-Path $Folder "wt"
-$TyroneFile = Join-Path $Folder "tyrone.json"
-# The Tyrone thread works here, outside every project: it can't change a project itself, so every change goes on a branch.
-$TyroneHome = Join-Path $Folder "tyrone"
+$SmokeyFile = Join-Path $Folder "smokey.json"
+# Before 4.3 (the assistant was Tyrone) its state was tyrone.json: picked up once, so the thread carries on.
+$OldStateFile = Join-Path $Folder "tyrone.json"
+if (-not (Test-Path -LiteralPath $SmokeyFile) -and (Test-Path -LiteralPath $OldStateFile)) { Copy-Item -LiteralPath $OldStateFile $SmokeyFile }
+# The Smokey thread works here, outside every project: it can't change a project itself, so every change goes on a branch.
+# A relay from before 4.3 made it as "tyrone"; that folder stays in use, because Claude Code finds a thread's
+# session by the folder it ran in, and a new folder would start the thread afresh.
+$SmokeyHome = if (Test-Path -LiteralPath (Join-Path $Folder "tyrone")) { Join-Path $Folder "tyrone" } else { Join-Path $Folder "smokey" }
+# Branches made before 4.3 keep their tyrone/... names and are still followed. New ones are smokey/... once the app
+# is agreed to take them (BranchPrefix); the copies (worktrees) are local, so new ones are smokey- already.
+$BranchPrefix = "tyrone"
+$BranchPrefixes = @("smokey", "tyrone")
+$CopyPrefix = "smokey"
+# A subthread's copy of its project (or a go-live or undo copy): the one already there under either name, else a new smokey- one.
+function Wt-Path([string]$repo, [string]$kind, [string]$sid) {
+  $tail = $(if ($kind) { "$kind-" } else { "" }) + $sid.Substring(3)
+  foreach ($p in $BranchPrefixes) { $wt = Join-Path $repo ".claude\worktrees\$p-$tail"; if (Test-Path -LiteralPath $wt) { return $wt } }
+  return Join-Path $repo ".claude\worktrees\$CopyPrefix-$tail"
+}
 $MaxSubthreads = 5
 # What a subthread may run without asking (Zack, 2026-11-26): its project's checks, and committing on its own
 # branch. Never push, deploy, switch branches or delete: anything else is refused.
@@ -71,7 +87,7 @@ $GoLive = @{
 }
 if ($env:CLAUDE_RELAY_GOLIVE) { $GoLive = @{}; foreach ($p in (Get-Content $env:CLAUDE_RELAY_GOLIVE -Raw | ConvertFrom-Json).PSObject.Properties) { $GoLive[$p.Name.ToLower()] = @{ branch = $p.Value.branch; checks = @($p.Value.checks); host = $p.Value.host; deploy = $p.Value.deploy; status = $p.Value.status; app = $p.Value.app } } }
 $GoLiveMinutes = 20
-# Tyrone building himself (4.0): a build waiting on an answer keeps its copy for this long, then is parked on its branch.
+# Smokey building himself (4.0): a build waiting on an answer keeps its copy for this long, then is parked on its branch.
 $AskHours = 24
 $BuildFolder = "project-checkin"
 $null = New-Item -ItemType Directory -Force $Folder
@@ -167,7 +183,7 @@ function Send-Threads([string]$key) {
   return "Sent $(@($threads).Count) threads ($working working, $needs waiting on you)."
 }
 
-# ---- Claude Code jobs from Tyrone: one Tyrone thread, and its subthreads ----
+# ---- Claude Code jobs from Smokey: one Smokey thread, and its subthreads ----
 function Web([string]$key) {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   $web = New-Object System.Net.WebClient
@@ -231,9 +247,9 @@ function Check-Failure([string]$out) {
 
 function Clip([string]$s, [int]$max) { $s = ($s -replace '\s+', ' ').Trim(); if ($s.Length -gt $max) { return $s.Substring(0, $max).TrimEnd() + "…" }; return $s }
 
-# The Tyrone thread's state: its Claude Code session, and notes for its next job (subthreads that finished since).
-function Get-Tyrone { $t = Read-Json $TyroneFile; if (-not $t) { $t = [pscustomobject]@{ sessionId = ""; notes = @() } }; if (-not $t.notes) { $t | Add-Member -Force notes @() }; return $t }
-function Add-Note([string]$text) { $t = Get-Tyrone; $t.notes = @(@($t.notes) + $text | Select-Object -Last 20); Write-Json $TyroneFile $t }
+# The Smokey thread's state: its Claude Code session, and notes for its next job (subthreads that finished since).
+function Get-Smokey { $t = Read-Json $SmokeyFile; if (-not $t) { $t = [pscustomobject]@{ sessionId = ""; notes = @() } }; if (-not $t.notes) { $t | Add-Member -Force notes @() }; return $t }
+function Add-Note([string]$text) { $t = Get-Smokey; $t.notes = @(@($t.notes) + $text | Select-Object -Last 20); Write-Json $SmokeyFile $t }
 
 # ---- What a run is doing, step by step, from Claude Code's stream ----
 $script:Streams = @{}
@@ -350,15 +366,15 @@ function Start-Claude([string]$dir, [string]$where, [string[]]$extra, [string]$p
 
 function Is-Running($job) { $p = Get-Process -Id ([int]$job.pid) -ErrorAction SilentlyContinue; return $p -and -not $p.HasExited -and $p.ProcessName -match "claude" }
 
-# ---- The Tyrone thread: every job Tyrone sends goes to it, one at a time ----
-function Tyrone-Prompt($t, [string]$homeDir, $notes) {
+# ---- The Smokey thread: every job Smokey sends goes to it, one at a time ----
+function Smokey-Prompt($t, [string]$homeDir, $notes) {
   $from = if ($t.from) { [string]$t.from } else { "you" }
   $projects = ((Get-JobFolders).Values | Sort-Object { $_.name } | ForEach-Object { "- " + $_.name + " (" + $_.path + ")" }) -join "`n"
   $running = @(Get-Subthreads | Where-Object { $_.state -eq "working" -or $_.state -eq "queued" } | ForEach-Object { "- " + $_.id + ": `"" + $_.title + "`" in " + $_.folder + " (" + $_.state + ")" }) -join "`n"
-  $hint = if ($t.claude.folder) { "`nTyrone named the project: $($t.claude.folder)." } else { "" }
+  $hint = if ($t.claude.folder) { "`nSmokey named the project: $($t.claude.folder)." } else { "" }
   $since = if (@($notes).Count) { "`nSince your last job:`n" + ((@($notes) | ForEach-Object { "- " + $_ }) -join "`n") + "`n" } else { "" }
   return @"
-You are the Tyrone thread: $from's one Claude Code thread for jobs sent by Tyrone, $from's assistant, from a phone call or chat. You run in the background with no one watching, and you only dispatch: you can't see or change the projects from here. $from's projects:
+You are the Smokey thread: $from's one Claude Code thread for jobs sent by Smokey, $from's assistant, from a phone call or chat. You run in the background with no one watching, and you only dispatch: you can't see or change the projects from here. $from's projects:
 $projects
 $since
 New job from ${from}:$hint
@@ -371,33 +387,33 @@ How to work:
 Running or waiting subthreads now:
 $(if ($running) { $running } else { "- none" })
 
-If something you need isn't allowed or isn't clear, don't guess: say what's needed. Finish with a short plain summary (a few sentences) of what you did, which subthreads you started and why, and anything left for $from to do; Tyrone reads it to them.
+If something you need isn't allowed or isn't clear, don't guess: say what's needed. Finish with a short plain summary (a few sentences) of what you did, which subthreads you started and why, and anything left for $from to do; Smokey reads it to them.
 "@
 }
 
-function Start-TyroneJob($key, $t) {
+function Start-SmokeyJob($key, $t) {
   $id = [string]$t.id
   $dir = Join-Path $JobsDir $id
   if (Test-Path $dir) { return }
   $null = New-Item -ItemType Directory -Force $dir
   $problem = Claude-Problem
   if (-not $problem -and -not @((Get-JobFolders).Values).Count) { $problem = "No project folders were found on this PC (where a Claude Code thread ran in the last 30 days), so there's nowhere for the work to go." }
-  $homeDir = $TyroneHome
+  $homeDir = $SmokeyHome
   $null = New-Item -ItemType Directory -Force $homeDir
   if ($problem) { Report $key $id "failed" $problem | Out-Null; Set-Content (Join-Path $dir "done.txt") "failed: not ready"; Log "Job $id not run: $problem"; return }
   $null = New-Item -ItemType Directory -Force $SpawnDir
-  $state = Get-Tyrone
+  $state = Get-Smokey
   # A session from before it moved to its own folder can't be picked up from here: start a new one (its notes carry over).
   if ($state.sessionId -and [string]$state.home -ne $homeDir) { $state.sessionId = "" }
   $state | Add-Member -Force home $homeDir
   $notes = @($state.notes)
   $extra = @("--add-dir", $SpawnDir)
   if ($state.sessionId) { $extra += @("--resume", [string]$state.sessionId) }
-  $p = Start-Claude $dir $homeDir $extra (Tyrone-Prompt $t $homeDir $notes)
-  $state.notes = @(); Write-Json $TyroneFile $state
+  $p = Start-Claude $dir $homeDir $extra (Smokey-Prompt $t $homeDir $notes)
+  $state.notes = @(); Write-Json $SmokeyFile $state
   Write-Json (Join-Path $dir "job.json") @{ pid = $p.Id; started = (Get-Date).ToString("o"); where = $homeDir; task = [string]$t.task; notes = $notes; resumed = [string]$state.sessionId }
-  Log "Job $id started in the Tyrone thread$(if ($state.sessionId) { '' } else { ' (a new one)' })."
-  Report $key $id "working" "The Tyrone thread on your PC picked it up." | Out-Null
+  Log "Job $id started in the Smokey thread$(if ($state.sessionId) { '' } else { ' (a new one)' })."
+  Report $key $id "working" "The Smokey thread on your PC picked it up." | Out-Null
 }
 
 function Check-Jobs($key, $openIds) {
@@ -414,27 +430,27 @@ function Check-Jobs($key, $openIds) {
     if ($running -and $age -lt $JobMinutes) { continue }
     if ($running) {
       Stop-Process -Id ([int]$job.pid) -Force -ErrorAction SilentlyContinue
-      $r = @{ ok = $false; text = "The Tyrone thread was still going after $JobMinutes minutes, so the job was stopped."; session = "" }
+      $r = @{ ok = $false; text = "The Smokey thread was still going after $JobMinutes minutes, so the job was stopped."; session = "" }
     } else { $r = Run-Result $d.FullName }
     # The thread's session carries on to the next job. A resume that failed starts a new thread next time, with the notes it missed.
-    $state = Get-Tyrone
+    $state = Get-Smokey
     if ($r.session) { $state.sessionId = $r.session }
     elseif ($job.resumed -and -not $r.ok) { $state.sessionId = ""; $state.notes = @(@($job.notes) + @($state.notes)) }
-    Write-Json $TyroneFile $state
+    Write-Json $SmokeyFile $state
     try {
-      $null = Report $key $d.Name $(if ($r.ok) { "done" } else { "failed" }) $(if ($r.text.Trim()) { $r.text.Trim() } else { "Done (the Tyrone thread gave no summary)." })
+      $null = Report $key $d.Name $(if ($r.ok) { "done" } else { "failed" }) $(if ($r.text.Trim()) { $r.text.Trim() } else { "Done (the Smokey thread gave no summary)." })
       Set-Content (Join-Path $d.FullName "done.txt") $(if ($r.ok) { "done" } else { "failed" })
       Log "Job $($d.Name) $(if ($r.ok) { 'done' } else { 'failed' })."
     } catch { Log ("Job $($d.Name) result not sent yet: " + (Why $_)) }
   }
 }
 
-# ---- Subthreads: started by the Tyrone thread, up to $MaxSubthreads at once ----
+# ---- Subthreads: started by the Smokey thread, up to $MaxSubthreads at once ----
 function Get-Subthreads { return @(Get-ChildItem $SubDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { Read-Json (Join-Path $_.FullName "sub.json") } | Where-Object { $_ }) }
 function Save-Sub($s) { Write-Json (Join-Path (Join-Path $SubDir $s.id) "sub.json") $s }
 function Slug([string]$s) { $x = ($s.ToLower() -replace '[^a-z0-9]+', '-').Trim('-'); if ($x.Length -gt 30) { $x = $x.Substring(0, 30).Trim('-') }; if (-not $x) { $x = "task" }; return $x }
 
-# Spawn files the Tyrone thread wrote: each becomes a waiting subthread; stop-<id>.json stops one.
+# Spawn files the Smokey thread wrote: each becomes a waiting subthread; stop-<id>.json stops one.
 function Take-Spawns {
   if (-not (Test-Path $SpawnDir)) { return }
   $folders = Get-JobFolders
@@ -444,7 +460,7 @@ function Take-Spawns {
       $s = Read-Json (Join-Path (Join-Path $SubDir $sid) "sub.json")
       if ($s -and ($s.state -eq "working" -or $s.state -eq "queued")) {
         if ($s.pid) { Stop-Process -Id ([int]$s.pid) -Force -ErrorAction SilentlyContinue }
-        $s.state = "stopped"; $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o")); $s | Add-Member -Force result "Stopped by the Tyrone thread."; Save-Sub $s; Close-Worktree $s
+        $s.state = "stopped"; $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o")); $s | Add-Member -Force result "Stopped by the Smokey thread."; Save-Sub $s; Close-Worktree $s
         Log "Subthread $sid stopped."
       }
       Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue; continue
@@ -474,7 +490,7 @@ function Close-Worktree($s) {
     # Anything the subthread didn't commit itself (its checks didn't pass, or it stopped) is still kept on its branch, marked as such.
     if (@(& git -C $wt status --porcelain 2>$null).Count) {
       & git -C $wt add -A 2>$null | Out-Null
-      & git -C $wt commit -q -m "Tyrone subthread (not committed by it; checks may not pass): $($s.title)" 2>$null | Out-Null
+      & git -C $wt commit -q -m "Smokey subthread (not committed by it; checks may not pass): $($s.title)" 2>$null | Out-Null
       $leftover = $true
     }
     Remove-Worktree ([string]$s.path) $wt
@@ -492,9 +508,9 @@ function Start-Sub($s) {
   $where = [string]$s.path
   if ($s.resume) { Resume-Sub $s; return }
   if (Test-Path -LiteralPath (Join-Path $where ".git")) {
-    $branch = "tyrone/" + (Slug $s.title) + "-" + $s.id.Substring(3)
+    $branch = "$BranchPrefix/" + (Slug $s.title) + "-" + $s.id.Substring(3)
     # Inside the project (.claude\worktrees, as the Claude app does it), so its checks find the project's installed packages by walking up.
-    $wt = Join-Path $where ".claude\worktrees\tyrone-$($s.id.Substring(3))"
+    $wt = Wt-Path $where "" ([string]$s.id)
     $base = (& git -C $where rev-parse HEAD 2>$null | Out-String).Trim()
     & git -C $where worktree add -q $wt -b $branch 2>$null | Out-Null
     if (-not (Test-Path -LiteralPath $wt)) { $s.state = "failed"; $s | Add-Member -Force result "Its own copy of $($s.folder) couldn't be made (git worktree), so it didn't start."; $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o")); Save-Sub $s; Add-Note "Subthread `"$($s.title)`" ($($s.folder)) failed: $($s.result)"; return }
@@ -503,7 +519,7 @@ function Start-Sub($s) {
     $where = $wt
   }
   $prompt = @"
-You are a subthread of the Tyrone thread, running in the background with no one watching. Do this in the $($s.folder) project$(if ($s.branch) { " (your own copy of it, on the branch $($s.branch))" }):
+You are a subthread of the Smokey thread, running in the background with no one watching. Do this in the $($s.folder) project$(if ($s.branch) { " (your own copy of it, on the branch $($s.branch))" }):
 
 $($s.task)
 
@@ -513,7 +529,7 @@ When the change is made, run the project's checks: its typecheck and unit tests 
 "@ })
 $(if ($s.build) { Ask-Rule $s })If something you need isn't allowed or isn't clear, don't guess: stop and say what's needed. Finish with a short plain summary (a few sentences) of what you did, what changed, which checks you ran and whether they passed, and whether you committed.
 "@
-  if ($s.build) { $prompt = "This is Tyrone's own app: $($s.folder) is the app Tyrone, $(Who $s)'s assistant, runs in, and this change is Tyrone building something into himself that $(Who $s) agreed to. Read the project's CLAUDE.md first and follow it.`n`n" + $prompt }
+  if ($s.build) { $prompt = "This is Smokey's own app: $($s.folder) is the app Smokey, $(Who $s)'s assistant, runs in, and this change is Smokey building something into himself that $(Who $s) agreed to. Read the project's CLAUDE.md first and follow it.`n`n" + $prompt }
   $p = Start-Claude $dir $where $(if ($s.branch) { @("--allowedTools") + $SubthreadTools } else { @() }) $prompt
   $s.state = "working"; $s | Add-Member -Force pid $p.Id; $s | Add-Member -Force startedAt ((Get-Date).ToUniversalTime().ToString("o")); Save-Sub $s
   Log "Subthread $($s.id) started in $where."
@@ -535,7 +551,8 @@ OPTIONS: <first option> | <second option>
 function Resume-Sub($s) {
   $ErrorActionPreference = "Continue"
   $dir = Join-Path $SubDir $s.id
-  $repo = [string]$s.path; $wt = Join-Path $repo ".claude\worktrees\tyrone-$($s.id.Substring(3))"
+  # The copy it was asking in, wherever it is (a build from before 4.3 has a tyrone- one); else a new one from its branch.
+  $repo = [string]$s.path; $wt = if ($s.worktree -and (Test-Path -LiteralPath ([string]$s.worktree))) { [string]$s.worktree } else { Wt-Path $repo "" ([string]$s.id) }
   if (-not (Test-Path -LiteralPath $wt)) {
     & git -C $repo worktree add -q $wt ([string]$s.branch) 2>$null | Out-Null
     # Parked before it changed anything, its empty branch was dropped: start it again from where it began.
@@ -638,7 +655,7 @@ function Run-Ship([string]$sid) {
   $g = $GoLive[([string]$s.folder).ToLower()]
   if (-not $g) { Ship-Step $sid "failed" "$($s.folder) has no go-live steps."; return }
   $repo = [string]$s.path; $branch = [string]$s.branch
-  $wt = Join-Path $repo ".claude\worktrees\tyrone-live-$($sid.Substring(3))"
+  $wt = Wt-Path $repo "live" $sid
   try {
     Ship-Step $sid "going" "Getting the latest $($s.folder) from GitHub"
     & git -C $repo fetch -q origin 2>$null | Out-Null
@@ -649,7 +666,7 @@ function Run-Ship([string]$sid) {
     Link-Packages $repo $wt
     Ship-Step $sid "going" "Merging $branch into main"
     foreach ($from in @($branch, "origin/$($g.branch)")) {
-      $null = (& git -C $wt merge --no-edit -m "Merge $from (Tyrone: $($s.title))" $from 2>&1 | Out-String)
+      $null = (& git -C $wt merge --no-edit -m "Merge $from (Smokey: $($s.title))" $from 2>&1 | Out-String)
       if ($LASTEXITCODE) {
         $files = @(& git -C $wt diff --name-only --diff-filter=U 2>$null) -join ", "
         & git -C $wt merge --abort 2>$null | Out-Null
@@ -707,7 +724,7 @@ function Run-Undo([string]$sid) {
   $g = $GoLive[([string]$s.folder).ToLower()]
   if (-not $g) { Undo-Step $sid "failed" "$($s.folder) has no go-live steps."; return }
   $repo = [string]$s.path; $branch = [string]$s.branch
-  $wt = Join-Path $repo ".claude\worktrees\tyrone-undo-$($sid.Substring(3))"
+  $wt = Wt-Path $repo "undo" $sid
   $patch = Ship-File $sid "undo.patch"
   try {
     Undo-Step $sid "going" "Getting the latest $($s.folder) from GitHub"
@@ -723,9 +740,9 @@ function Run-Undo([string]$sid) {
     $out = (& git -C $wt apply -R --3way $patch 2>&1 | Out-String)
     if ($LASTEXITCODE -or @(& git -C $wt diff --name-only --diff-filter=U 2>$null).Count) { throw "Newer changes on main touch the same lines, so it can't be taken out cleanly; nothing was pushed. $(Clip $out 300)" }
     & git -C $wt add -A 2>$null | Out-Null
-    & git -C $wt commit -q -m "Undo: $($s.title) (Tyrone)" 2>$null | Out-Null
+    & git -C $wt commit -q -m "Undo: $($s.title) (Smokey)" 2>$null | Out-Null
     if ($LASTEXITCODE) { throw "There was nothing left to take out (main no longer has its changes)." }
-    $null = (& git -C $wt merge --no-edit -m "Merge origin/$($g.branch) (Tyrone undo)" "origin/$($g.branch)" 2>&1 | Out-String)
+    $null = (& git -C $wt merge --no-edit -m "Merge origin/$($g.branch) (Smokey undo)" "origin/$($g.branch)" 2>&1 | Out-String)
     if ($LASTEXITCODE) { & git -C $wt merge --abort 2>$null | Out-Null; throw "It clashes with newer changes on $($g.branch), so nothing was pushed." }
     Push-Live $sid $wt $g { param($st, $tx, $c) Undo-Step $sid $(if ($st -eq "live") { "done" } else { $st }) $tx $c } "Undone"
   } catch {
@@ -776,7 +793,7 @@ function Check-Undos {
   }
 }
 
-# Starts waiting ones (one per project at a time), notices one that died, and tells the Tyrone thread how each ended.
+# Starts waiting ones (one per project at a time), notices one that died, and tells the Smokey thread how each ended.
 function Check-Ships {
   $all = @(Get-Subthreads)
   foreach ($s in $all) {
@@ -800,13 +817,13 @@ function Check-Ships {
   }
 }
 
-# ---- Merged by hand (4.1): what actually happened to each tyrone/ branch after the relay was done with it ----
+# ---- Merged by hand (4.1): what actually happened to each smokey/ (or older tyrone/) branch after the relay was done with it ----
 # A branch that didn't go live on its own (a clash, a failed check, a project with no go-live steps) is often merged
 # by someone later, sometimes as a copy brought up to main. Every two minutes the relay looks at git and the devbox:
-# each tyrone/ branch is "merged" (its last commit is in main's history), "copied" (main has the same changes, or a
+# each smokey/ (or older tyrone/) branch is "merged" (its last commit is in main's history), "copied" (main has the same changes, or a
 # commit on main names its last commit), or not on main yet; one that's on main is checked against the deploy
 # branch and what's live. Each subthread's merged.json is updated, and the whole list goes to the app with the live
-# report, so Tyrone's job list says what really happened.
+# report, so Smokey's job list says what really happened.
 $BranchesFile = Join-Path $Folder "branches.json"
 $script:BranchList = @()
 
@@ -821,7 +838,7 @@ function Find-OnMain([string]$repo, [string]$branch, [string]$head, [string]$bas
     return @{ how = "merged"; commit = $(if ($first.Count) { [string]$first[0] } else { $head }) }
   }
   $since = @(Git-Lines $repo @("log", "-1", "--format=%cI", $head))
-  # A copy brought up to main says where it came from ("... from 3c991fc", "Merge tyrone/..."): the oldest such commit.
+  # A copy brought up to main says where it came from ("... from 3c991fc", "Merge smokey/..."): the oldest such commit.
   foreach ($needle in @($head.Substring(0, 7), $branch)) {
     $a = @("log", "origin/main", "--fixed-strings", "--grep=$needle", "--format=%H"); if ($since.Count) { $a += "--since=$($since[0])" }
     $hit = @(Git-Lines $repo $a | Select-Object -Last 1)
@@ -866,7 +883,7 @@ function Check-Merged {
   $out = @()
   foreach ($r in $repos.Values) {
     $repo = $r.path
-    $refs = @(Git-Lines $repo @("for-each-ref", "--format=%(refname:short)`t%(objectname)`t%(committerdate:iso-strict)", "refs/heads/tyrone/"))
+    $refs = @(Git-Lines $repo (@("for-each-ref", "--format=%(refname:short)`t%(objectname)`t%(committerdate:iso-strict)") + @($BranchPrefixes | ForEach-Object { "refs/heads/$_/" })))
     if (-not $refs.Count) { continue }
     $null = Git-Ok $repo @("fetch", "-q", "origin")
     $mainTip = Git-One $repo @("rev-parse", "origin/main")
@@ -934,7 +951,7 @@ function Check-Merged {
   }
 }
 
-# ---- Live: what the Tyrone thread and its subthreads are doing, step by step, for Talk ----
+# ---- Live: what the Smokey thread and its subthreads are doing, step by step, for Talk ----
 function Live-Body {
   $job = $null
   foreach ($d in @(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue)) {
@@ -966,13 +983,15 @@ function Live-Body {
     if ($m) { $o.merged = [ordered]@{ state = [string]$m.state; how = [string]$m.how; commit = [string]$m.commit; at = [string]$m.at }; if ($m.onDev) { $o.merged.onDev = $true }; if ($m.deploy) { $o.merged.deploy = [string]$m.deploy } }
     $o
   })
-  # Every tyrone/ branch and whether it's on main, dev and live (newest first), as of the last check.
+  # Every smokey/ and tyrone/ branch and whether it's on main, dev and live (newest first), as of the last check.
   $branches = @($script:BranchList | Select-Object -First 60 | ForEach-Object {
     $b = [ordered]@{ folder = [string]$_.folder; branch = [string]$_.branch; head = [string]$_.head; at = [string]$_.at; onMain = [bool]$_.onMain; checkedAt = [string]$_.checkedAt }
     if ($_.onMain) { $b.how = [string]$_.how; $b.commit = [string]$_.commit; $b.onDev = [bool]$_.onDev; $b.live = [bool]$_.live; if ($_.deploy) { $b.deploy = [string]$_.deploy } }
     $b
   })
-  return @{ tyrone = @{ version = $Version; state = $(if ($job) { "working" } else { "idle" }); job = $job; subthreads = $subs; max = $MaxSubthreads; branches = $branches } }
+  # Sent as "smokey" and, until the app reads that, as "tyrone" too (the key the app read before the rename): the same report.
+  $report = @{ version = $Version; state = $(if ($job) { "working" } else { "idle" }); job = $job; subthreads = $subs; max = $MaxSubthreads; branches = $branches }
+  return @{ smokey = $report; tyrone = $report }
 }
 
 $script:LastLive = ""; $script:LastLiveAt = [DateTime]::MinValue
@@ -987,7 +1006,7 @@ function Send-Live([string]$key) {
 
 function Busy { return [bool]((@(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { -not (Test-Path (Join-Path $_.FullName "done.txt")) -and (Test-Path (Join-Path $_.FullName "job.json")) }).Count) -or @(Get-Subthreads | Where-Object { $_.state -eq "working" -or $_.state -eq "queued" -or @("waiting", "going") -contains [string](Read-Json (Ship-File $_.id "ship.json")).state -or [string](Read-Json (Ship-File $_.id "undo.json")).state -eq "going" }).Count) }
 
-# ---- Tyrone building himself (4.0): an item from his features and bugs list, straight to a subthread ----
+# ---- Smokey building himself (4.0): an item from his features and bugs list, straight to a subthread ----
 function Find-Sub([string]$sid, [string]$item) {
   $all = @(Get-Subthreads)
   $hit = if ($sid) { $all | Where-Object { $_.id -eq $sid } | Select-Object -First 1 } else { $null }
@@ -1042,14 +1061,14 @@ function Poll-Jobs([string]$key) {
   $null = New-Item -ItemType Directory -Force $JobsDir, $SubDir, $WtDir, $SpawnDir
   $tasks = @(((Web $key).DownloadString($TasksUrl) | ConvertFrom-Json).tasks)
   $open = @($tasks | ForEach-Object { [string]$_.id })
-  # Builds go straight to a subthread, not the Tyrone thread.
+  # Builds go straight to a subthread, not the Smokey thread.
   foreach ($t in @($tasks | Where-Object { $_.claude -and $_.claude.build })) { Take-Build $key $t }
   Check-Jobs $key $open
-  # One Tyrone job at a time: the next one starts when it's free.
+  # One Smokey job at a time: the next one starts when it's free.
   $running = @(Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { (Test-Path (Join-Path $_.FullName "job.json")) -and -not (Test-Path (Join-Path $_.FullName "done.txt")) }).Count
   if (-not $running) {
     $next = $tasks | Where-Object { $_.claude -and -not $_.claude.build -and -not (Test-Path (Join-Path $JobsDir ([string]$_.id))) } | Select-Object -First 1
-    if ($next) { Start-TyroneJob $key $next }
+    if ($next) { Start-SmokeyJob $key $next }
   }
   # Old job folders go after a week.
   Get-ChildItem $JobsDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) -and (Test-Path (Join-Path $_.FullName "done.txt")) } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -1086,7 +1105,7 @@ if ($Connect) {
           $ok = $true
         }
       }
-      $html = if ($ok) { "<!doctype html><meta charset=utf-8><title>Connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px'><h1>Connected</h1><p>The Claude relay on this PC can now tell Tyrone about your Claude Code threads. You can close this window.</p>" } else { "<!doctype html><meta charset=utf-8><title>Not connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px'><h1>Not connected</h1><p>That didn't come from this connect. Run ClaudeRelay.ps1 -Connect again.</p>" }
+      $html = if ($ok) { "<!doctype html><meta charset=utf-8><title>Connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px'><h1>Connected</h1><p>The Claude relay on this PC can now tell Smokey about your Claude Code threads. You can close this window.</p>" } else { "<!doctype html><meta charset=utf-8><title>Not connected</title><body style='font-family:Segoe UI,sans-serif;padding:40px'><h1>Not connected</h1><p>That didn't come from this connect. Run ClaudeRelay.ps1 -Connect again.</p>" }
       $bytes = [Text.Encoding]::UTF8.GetBytes($html)
       $ctx.Response.ContentType = "text/html; charset=utf-8"; $ctx.Response.StatusCode = $(if ($ok) { 200 } else { 400 })
       $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length); $ctx.Response.Close()
@@ -1112,7 +1131,7 @@ if ($Install) {
   # A running older copy stops first, so the new one takes over.
   if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Tells Tyrone (Project Check-in) what's going on in your Claude Code threads. $self" -Force | Out-Null
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Tells Smokey (Project Check-in) what's going on in your Claude Code threads. $self" -Force | Out-Null
   Start-ScheduledTask -TaskName $TaskName
   Log "Installed: starts at sign-in, running now."
   exit 0
@@ -1135,9 +1154,9 @@ if ($Doctor) {
     } else { Write-Host "Signed in for jobs: yes" -ForegroundColor Green }
   }
   Write-Host ("Connected to Project Check-in: " + $(if (Get-Key) { "yes" } else { "no (run ClaudeRelay.ps1 -Connect)" }))
-  Write-Host ("The Tyrone thread works in: $TyroneHome (outside your projects: every change goes to a subthread, on its own branch)")
-  $ty = Get-Tyrone
-  Write-Host ("Tyrone thread session: " + $(if ($ty.sessionId) { $ty.sessionId } else { "not started yet (the first job starts it)" }))
+  Write-Host ("The Smokey thread works in: $SmokeyHome (outside your projects: every change goes to a subthread, on its own branch)")
+  $ty = Get-Smokey
+  Write-Host ("Smokey thread session: " + $(if ($ty.sessionId) { $ty.sessionId } else { "not started yet (the first job starts it)" }))
   Write-Host "Projects it and its subthreads can work on (where a Claude Code thread ran in the last 30 days):"
   (Get-JobFolders).Values | Sort-Object { $_.name } | ForEach-Object { Write-Host ("  " + $_.name + "  " + $_.path) }
   exit 0
@@ -1145,7 +1164,7 @@ if ($Doctor) {
 
 if ($DryRun) { ConvertTo-Json -InputObject @{ threads = @(Get-Threads); folders = @((Get-JobFolders).Values | ForEach-Object { $_.name } | Sort-Object) } -Depth 4; exit 0 }
 
-# -Branches: checks every tyrone/ branch now and shows where each is (on main, on dev, live), sends nothing.
+# -Branches: checks every smokey/ and tyrone/ branch now and shows where each is (on main, on dev, live), sends nothing.
 if ($Branches) { Check-Merged; ConvertTo-Json -InputObject @($script:BranchList) -Depth 4; exit 0 }
 # -Ship <subthread id>: the relay starts this, hidden, to put one finished subthread live.
 if ($Ship) { Run-Ship $Ship; exit 0 }
@@ -1159,7 +1178,7 @@ if ($Once) { try { Log (Send-Threads $key); exit 0 } catch { Log ("Not sent: " +
 # One relay at a time.
 $mutex = New-Object System.Threading.Mutex($false, "Local\ClaudeRelay")
 if (-not $mutex.WaitOne(0)) { Write-Host "The Claude relay is already running." -ForegroundColor Yellow; exit 0 }
-Log "Claude relay $Version running: sending your threads every two minutes, jobs to the Tyrone thread (up to $MaxSubthreads subthreads), live steps while anything runs."
+Log "Claude relay $Version running: sending your threads every two minutes, jobs to the Smokey thread (up to $MaxSubthreads subthreads), live steps while anything runs."
 $lastNote = ""; $lastJobNote = ""; $lastLiveNote = ""; $nextThreads = Get-Date; $nextJobs = Get-Date
 while ($true) {
   $key = Get-Key
@@ -1167,7 +1186,7 @@ while ($true) {
     $note = if (-not $key) { "Not connected: run ClaudeRelay.ps1 -Connect" } else { try { Send-Threads $key } catch { "Not sent: " + (Why $_) } }
     # The log gets a line when something changes, not every two minutes.
     if ($note -ne $lastNote) { Log $note; $lastNote = $note }
-    # Where each tyrone/ branch ended up (merged or copied into main by hand, deployed), for Tyrone's job list.
+    # Where each smokey/ (or older tyrone/) branch ended up (merged or copied into main by hand, deployed), for Smokey's job list.
     try { Check-Merged } catch { Log ("Branches not checked: " + (Why $_)) }
     $nextThreads = (Get-Date).AddMinutes(2)
   }
