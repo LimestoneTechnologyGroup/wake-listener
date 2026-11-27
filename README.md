@@ -2,16 +2,16 @@
 
 Say **"hey Tyrone"** and your Project Check-in assistant opens and starts talking.
 
-Since 6.5 it listens in **two stages, the way smart speakers do**. A small keyword spotter ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)) catches anything like the phrase, and a voice detector passes on every short burst of speech. A speech-to-text model ([Moonshine](https://github.com/moonshine-ai/moonshine)) then checks the words before Tyrone opens. It runs on your PC; nothing is sent anywhere.
+Since 6.5 it listens in **two stages, the way smart speakers do**. A small keyword spotter ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)) catches anything like the phrase, a voice detector passes on every short burst of speech, and since 6.6 a detector trained on "hey Tyrone" itself listens too. A speech-to-text model ([Moonshine](https://github.com/moonshine-ai/moonshine)) then checks the words before Tyrone opens. It runs on your PC; nothing is sent anywhere.
 
 ## Install
 
-1. Download the latest version from **[Releases](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest)**: the file named with its version, such as `WakeListener-6.5.0.zip` (`WakeListener.zip` there is the same file). Right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
+1. Download the latest version from **[Releases](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest)**: the file named with its version, such as `WakeListener-6.6.0.zip` (`WakeListener.zip` there is the same file). Right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
 2. Double-click **Start wake listener.cmd**. (If Windows asks about running it, choose **Run**.)
 3. **First run: it sets up the engine** (a few minutes, once, needs the internet). The activity window shows each step:
    - Python: it uses yours (3.11 to 3.14), or installs Python 3.12 from python.org for your Windows account only, through winget;
-   - its own Python environment and the engine's packages (sherpa-onnx, sounddevice, numpy, sentencepiece), in `%LOCALAPPDATA%\WakeListener`;
-   - three models from sherpa-onnx's releases (the 17 MB keyword spotter, the 106 MB speech-to-text check and a 0.2 MB voice detector), each checked against its SHA-256 before it's used. Updating from 6.4 or earlier downloads the two new ones once.
+   - its own Python environment and the engine's packages (sherpa-onnx, sounddevice, numpy, sentencepiece, onnxruntime), in `%LOCALAPPDATA%\WakeListener`;
+   - three models from sherpa-onnx's releases (the 17 MB keyword spotter, the 106 MB speech-to-text check and a 0.2 MB voice detector) and two from openWakeWord's (2.4 MB, the trained detector's front end), each checked against its SHA-256 before it's used. Updating downloads whatever's new once.
 4. Say **"hey Tyrone"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
 
 **Floating Tyrone** stays on top of every window, above the clock to start with:
@@ -71,16 +71,16 @@ powershell -ExecutionPolicy Bypass -File WakeListener.ps1 -Test
 
 Windows' own voices say "hey Tyrone" at different speeds, some over loud music, and other things that come close ("Tyrone called about the permit", "my brother Tyrone", "hey there Ron", "hey Tony", "high tone"). Each recording goes through the engine the way the microphone's sound does: the phrase must open, the others mustn't. The engine has to be set up first, by starting the listener once.
 
-How 6.5 compares with 6.4, on 81 "hey Tyrone" recordings and 420 near misses (three Windows voices, three speeds, sound made to match each room):
+How each version compares, on 81 "hey Tyrone" recordings and 420 near misses (three Windows voices, three speeds, sound made to match each room):
 
-| Sound | 6.4 caught | 6.5 caught | False opens, 6.4 / 6.5 |
-|---|---|---|---|
-| Close to the mic | 93% | 99% | 3 / 3 |
-| Bluetooth (phone quality) | 88% | 96% | 1 / 1 |
-| Across a room | 49% | 80% | 6 / 5 |
-| Over music | 67% | 94% | 3 / 3 |
-| Across a room, with music | 26% | 60% | 4 / 4 |
-| Another room | 4% | 21% | 1 / 2 |
+| Sound | 6.4 caught | 6.5 caught | 6.6 caught | False opens, 6.4 / 6.5 / 6.6 |
+|---|---|---|---|---|
+| Close to the mic | 93% | 99% | 100% | 3 / 3 / 3 |
+| Bluetooth (phone quality) | 88% | 99% | 100% | 1 / 1 / 1 |
+| Across a room | 49% | 80% | 83% | 6 / 5 / 6 |
+| Over music | 67% | 94% | 93% | 3 / 3 / 3 |
+| Across a room, with music | 26% | 60% | 78% | 4 / 4 / 5 |
+| Another room | 4% | 21% | 23% | 1 / 2 / 2 |
 
 The false opens all come from the 240 deliberately close phrases ("hey Tyrion", "hey, tie the rope", "hey Cairo"). None came from the 180 everyday ones.
 
@@ -90,9 +90,12 @@ The false opens all come from the 240 deliberately close phrases ("hey Tyrion", 
 - `listen.py` reads the microphone (sounddevice) and evens out the level (slow automatic gain, so quiet or far-off talk is brought up). Three things listen to it:
   - **the spotter as before 6.5** (sherpa-onnx keyword spotting on the phrase's own spelling): opens unless the check's words are plainly something else;
   - **the spotter set loose**, with sound-alike spellings of the name ("tie rone", "ty ron"): opens if the check's words have the name (or near it) at the start;
+  - **the trained detector** (6.6, below): when it scores the sound as "hey Tyrone", the check runs, and opens only if the words hold a greeting right before the name ("Tyrone's report is late" and "hey, it's Tyrone's turn" don't);
   - **the voice detector** (Silero): every short burst of speech is checked, and opens only if the words clearly hold "hey" or "hi" right before the name. This catches the times the spotter misses.
 - **The check** is Moonshine's base English model: it turns the last couple of seconds into words in about 40 ms. Names come out spelled many ways ("Tyron", "Detyrone", "Hey, chiron"), so the words are compared by a rough sound key, and everyday words run together ("try one") don't count.
-- The sensitivity sets how loose the spotters are and how close the words must be.
+- The sensitivity sets how loose the spotters are, how high the trained detector must score and how close the words must be.
+
+**The trained detector** (`hey_tyrone.onnx`, 0.9 MB, shipped with it) is built the [openWakeWord](https://github.com/dscripka/openWakeWord) way: a mel spectrogram and Google's speech embedding model (`melspectrogram.onnx`, `embedding_model.onnx`, both frozen, downloaded at setup from openWakeWord's v0.5.1 release rather than kept here), then a small network trained here on about 20,000 synthetic "hey Tyrone"s (1,000+ voices from Piper and Kokoro, in made-up rooms, over noise and music, at Bluetooth quality) against 95 hours of LibriSpeech audiobook speech (CC BY 4.0) and 12,000 near misses. On 4.7 hours of held-out speech it scores high about once an hour on its own, which is why it never opens without the check. It's what lifts "across a room, with music" from 60% to 78%. Every 80 ms it costs a few milliseconds of CPU.
 
 Earlier versions:
 - **6.0 to 6.4** used the keyword spotter alone. Good up close, but it missed most of the time across a room or over music.

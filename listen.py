@@ -31,6 +31,7 @@ ASR = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
 VAD = "silero_vad.int8.onnx"
 RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 # What setup fetches: (folder or file, url, sha256, files kept from the archive).
+OWW = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1"
 MODELS = [
     (KWS, f"{RELEASES}/kws-models/{KWS}.tar.bz2", "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a",
      ["tokens.txt", "bpe.model", "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
@@ -38,6 +39,9 @@ MODELS = [
     (ASR, f"{RELEASES}/asr-models/{ASR}.tar.bz2", "43232c1d13013d37317163baec3135bd771a186a4356f28c889bab453bb0e891",
      ["tokens.txt", "encoder_model.ort", "decoder_model_merged.ort"]),
     (VAD, f"{RELEASES}/asr-models/{VAD}", "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20", None),
+    # The trained detector's front end, from openWakeWord's release (downloaded, not shipped here).
+    ("melspectrogram.onnx", f"{OWW}/melspectrogram.onnx", "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f", None),
+    ("embedding_model.onnx", f"{OWW}/embedding_model.onnx", "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f", None),
 ]
 KWS_FILES = MODELS[0][3]
 # How easily the spotter fires: (threshold, boost). With the check behind it, it can be loose.
@@ -46,6 +50,12 @@ SENSITIVITY = {"low": (0.12, 2.0), "normal": (0.06, 3.0), "high": (0.03, 4.0)}
 ALONE = {"low": (0.2, 1.5), "normal": (0.1, 2.0), "high": (0.05, 3.0)}
 # How close a heard word must be to the name, by sensitivity.
 CLOSENESS = {"low": 0.82, "normal": 0.75, "high": 0.68}
+# The trained detector: openWakeWord's front end (in the engine folder) and our "hey Tyrone" network (next to this file).
+HERE = os.path.dirname(os.path.abspath(__file__))
+DETECTOR = ("melspectrogram.onnx", "embedding_model.onnx", "hey_tyrone.onnx")
+# The score at which it asks for the second check, by sensitivity. It never wakes on its own: a high score on
+# "my brother Tyrone" or "hey Tyler" is common, so the words have to be a greeting and the name too.
+DETECTOR_LEVELS = {"low": 0.7, "normal": 0.5, "high": 0.3}
 
 
 def say(*parts):
@@ -168,14 +178,19 @@ def name_score(text, phrase, loose=False):
     return best, greeted, first, merged
 
 
-def verdict(text, phrase, closeness, spotted):
+def verdict(text, phrase, closeness, spotted, bare=True):
     """'yes' to open, 'close' for a near miss worth logging, None for other talk.
 
-    spotted: the keyword spotter fired too, so less evidence is needed from the words."""
+    spotted: a spotter or the detector fired too, so less evidence is needed from the words.
+    bare: the name alone at the start counts (the spotters heard "hey" that the words lost). Not for the detector,
+    which also scores high on "Tyrone's report is late"."""
     best, greeted, first, merged = name_score(text, phrase)
     if best >= closeness and greeted:
         return "yes"
-    if spotted:
+    if spotted and not bare:  # the detector: the greeting right before the name, as heard ("hey, it's Tyrone's" isn't)
+        if max(best if greeted else 0, merged) >= closeness - 0.05:
+            return "yes"
+    elif spotted:
         best, greeted, first, merged = name_score(text, phrase, loose=True)
         if max(best if (greeted or first) else 0, merged) >= closeness - 0.05:
             return "yes"
@@ -212,6 +227,55 @@ def to16k(x, rate):
     return np.interp(np.arange(n) * (rate / RATE), np.arange(len(x)), x).astype(np.float32)
 
 
+class Detector:
+    """The trained "hey Tyrone" detector (openWakeWord style): a mel spectrogram and Google's speech embedding (both
+    frozen), then a small network trained on thousands of synthetic voices. Every 80 ms it gives a score from 0 to 1."""
+
+    def __init__(self, folder):
+        import numpy as np
+        import onnxruntime as ort
+        o = ort.SessionOptions()
+        o.intra_op_num_threads = 1
+        o.inter_op_num_threads = 1
+        run = lambda path: ort.InferenceSession(path, o, providers=["CPUExecutionProvider"])
+        self.np = np
+        self.mel, self.emb = run(os.path.join(folder, DETECTOR[0])), run(os.path.join(folder, DETECTOR[1]))
+        self.net = run(os.path.join(HERE, DETECTOR[2]))
+        self.net_in = self.net.get_inputs()[0].name
+        self.reset()
+
+    def reset(self):
+        np = self.np
+        self.buf = np.zeros(RATE * 2, np.float32)  # the last 2 seconds, in the units the models expect (int16 scale)
+        self.new = 0
+        self.embs = np.zeros((16, 96), np.float32)
+        self.count = 0
+
+    def feed(self, x):
+        """16 kHz float samples in (before any levelling); returns the best score seen in them."""
+        np = self.np
+        x = x * 32767
+        n = len(x)
+        if n >= len(self.buf):
+            self.buf[:] = x[-len(self.buf):]
+        else:
+            self.buf[:-n] = self.buf[n:]
+            self.buf[-n:] = x
+        self.new += n
+        best = 0.0
+        while self.new >= 1280:
+            self.new -= 1280
+            end = len(self.buf) - self.new
+            spec = self.mel.run(None, {"input": self.buf[end - 12560:end][None]})[0][0, 0] / 10 + 2
+            e = self.emb.run(None, {"input_1": spec[-76:][None, :, :, None].astype(np.float32)})[0].reshape(96)
+            self.embs[:-1] = self.embs[1:]
+            self.embs[-1] = e
+            self.count += 1
+            if self.count >= 16:
+                best = max(best, float(self.net.run(None, {self.net_in: self.embs[None]})[0].reshape(-1)[0]))
+        return best
+
+
 class Ears:
     """Takes 16 kHz sound in pieces and says when the phrase was heard. No microphone needed (tests feed it).
 
@@ -219,6 +283,8 @@ class Ears:
       sure:    the spotter set as before 6.5 (the phrase's own spelling): opens unless the words are plainly
                something else ("hey, tie the rope").
       spotter: the spotter set loose, with sound-alikes: opens if the words check out.
+      (The trained detector, when its files are here, counts as sure on a high score and as the loose spotter on a
+      middling one.)
       speech:  any short burst of speech: opens if the words clearly hold the greeting and the name."""
 
     def __init__(self, folder, phrase, sensitivity, check=True):
@@ -238,6 +304,12 @@ class Ears:
 
         self.sure = spotter("keywords.txt", ALONE, False)
         self.raw = np.zeros(RATE * 8, np.float32)  # the last 8 seconds as the microphone gave them, for "it missed me"
+        self.det, self.det_level = None, DETECTOR_LEVELS.get(sensitivity, DETECTOR_LEVELS["normal"])
+        if self.check and "--no-detector" not in sys.argv and all(os.path.exists(p) for p in (os.path.join(folder, DETECTOR[0]), os.path.join(folder, DETECTOR[1]), os.path.join(HERE, DETECTOR[2]))):
+            try:
+                self.det = Detector(folder)
+            except Exception as e:  # noqa: BLE001 - the spotters still work without it
+                say("note", f"the trained detector didn't start ({type(e).__name__}: {e}), so the spotters listen alone")
         if self.check:
             self.maybe = spotter("keywords-loose.txt", SENSITIVITY, True)
             a = os.path.join(folder, ASR)
@@ -262,13 +334,15 @@ class Ears:
         self.level = Leveller()
         self.heard = self.quiet_until = 0  # samples so far; no second wake until then
         self.raw[:] = 0
+        if getattr(self, "det", None):
+            self.det.reset()
         self.sure_stream = self.sure.create_stream()
         if self.check:
             self.maybe_stream = self.maybe.create_stream()
             self.vad.reset()
             self.ring[:] = 0
             self.vad_left = self.np.zeros(0, self.np.float32)
-            self.pending, self.pending_sure = None, False  # when a spotter fired: check once a little more has been heard
+            self.pending, self.pending_how = None, None  # when a spotter fired: check once a little more has been heard
 
     def words(self, x):
         """The words in some sound. Long silence either side is trimmed first: the model tends to hear nothing at all
@@ -288,7 +362,7 @@ class Ears:
     def judge(self, x, how):
         """Runs the check on some sound; True when it's the phrase."""
         text = self.words(x)
-        v = verdict(text, self.phrase, self.closeness, how != "speech")
+        v = verdict(text, self.phrase, self.closeness, how != "speech", how != "detector")
         # The spotter set as before 6.5 is overruled only when the words are plainly something else.
         if v == "yes" or (how == "sure" and (v == "close" or len(re.findall(r"[a-z]+", text.lower())) < 2)):
             say("heard", "yes", how, text)
@@ -340,8 +414,9 @@ class Ears:
         """16 kHz float samples in; returns True when the phrase was heard."""
         np = self.np
         self.keep(self.raw, x)
-        x = self.level(x)
+        x_raw, x = x, self.level(x)
         self.heard += len(x)
+        score = self.det.feed(x_raw) if self.det else 0.0
         sure = self.fired(self.sure, self.sure_stream, x)
         if not self.check:
             if sure:
@@ -349,15 +424,17 @@ class Ears:
             return self.wake(sure)
         woke = False
         self.keep(self.ring, x)
-        maybe = self.fired(self.maybe, self.maybe_stream, x)
-        if (sure or maybe) and self.pending is None:
-            self.pending, self.pending_sure = self.heard + int(RATE * 0.5), sure
-        elif sure:
-            self.pending_sure = True
+        spotted = self.fired(self.maybe, self.maybe_stream, x)
+        how = "sure" if sure else "spotter" if spotted else "detector" if score >= self.det_level else None
+        rank = {"sure": 3, "spotter": 2, "detector": 1}
+        if how and self.pending is None:
+            self.pending, self.pending_how = self.heard + int(RATE * 0.5), how
+        elif how and rank[how] > rank[self.pending_how]:
+            self.pending_how = how
         # A spotter fired a moment ago: check the 3 seconds around it.
         if self.pending is not None and self.heard >= self.pending:
             at, self.pending = self.pending, None
-            if self.heard >= self.quiet_until and self.judge(self.recent(at - RATE * 3, at), "sure" if self.pending_sure else "spotter"):
+            if self.heard >= self.quiet_until and self.judge(self.recent(at - RATE * 3, at), self.pending_how):
                 woke = True
         # Each short burst of speech gets a look too, in case the spotters missed it.
         buf = np.concatenate([self.vad_left, x])

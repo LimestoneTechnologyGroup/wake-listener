@@ -3,9 +3,11 @@
 # Plain PowerShell, no exe. The listening is done by listen.py (next to this
 # file) in two stages, the way smart speakers work: a small keyword spotter
 # (sherpa-onnx) catches anything like the phrase, then a speech-to-text model
-# (Moonshine) checks the words before it opens. It runs on this PC; nothing is
-# sent anywhere. The first run sets it up (Python, the engine and its models,
-# about 125 MB, in %LOCALAPPDATA%\WakeListener). When it hears the phrase it
+# (Moonshine) checks the words before it opens. Since 6.6 a small detector
+# trained on "hey Tyrone" (hey_tyrone.onnx and the two openWakeWord front-end
+# models next to this file) can call for the check too. It runs on this PC;
+# nothing is sent anywhere. The first run sets it up (Python, the engine and
+# its models, about 125 MB, in %LOCALAPPDATA%\WakeListener). When it hears the phrase it
 # opens the assistant's voice page, which starts talking.
 #
 # Close calls go to heard.log there, and "He missed me just now" on the menu
@@ -19,7 +21,7 @@
 
 param([switch]$Test)
 
-$Version = "6.5.0"
+$Version = "6.6.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Tyrone"   # what you'll say (two or three words work best)
@@ -34,7 +36,7 @@ $EngineFolder  = Join-Path $env:LOCALAPPDATA "WakeListener"
 $AssistantTitle = "Assistant ·"
 $GraceSecs     = 15
 # The engine's packages, at versions tested with this release.
-$Packages      = @("sherpa-onnx==2.0.3", "sounddevice==0.5.6", "numpy==2.5.5", "sentencepiece==0.2.3")
+$Packages      = @("sherpa-onnx==2.0.3", "sounddevice==0.5.6", "numpy==2.5.5", "sentencepiece==0.2.3", "onnxruntime==1.32.0")
 # -----------------------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
@@ -761,7 +763,7 @@ function Test-Engine {
   $marker = Join-Path $EngineFolder "packages.txt"
   if (-not (Test-Path $marker) -or (Get-Content $marker -Raw).Trim() -ne ($Packages -join " ")) { return $false }
   # The spotter, the speech check and the speech detector (listen.py's MODELS).
-  foreach ($f in @("sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01\tokens.txt", "sherpa-onnx-moonshine-base-en-quantized-2026-02-27\decoder_model_merged.ort", "silero_vad.int8.onnx")) {
+  foreach ($f in @("sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01\tokens.txt", "sherpa-onnx-moonshine-base-en-quantized-2026-02-27\decoder_model_merged.ort", "silero_vad.int8.onnx", "melspectrogram.onnx", "embedding_model.onnx")) {
     if (-not (Test-Path (Join-Path $EngineFolder $f))) { return $false }
   }
   return $true
