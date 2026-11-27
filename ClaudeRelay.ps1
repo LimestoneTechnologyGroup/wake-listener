@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [switch]$Branches, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "4.2.0"
+$Version = "4.2.1"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -830,7 +830,8 @@ function Find-OnMain([string]$repo, [string]$branch, [string]$head, [string]$bas
   # A copy redone by hand on main that kept the branch's commit message word for word (4.2).
   $subject = Git-One $repo @("log", "-1", "--format=%s", $head)
   if ($subject.Length -ge 20) {
-    $a = @("log", "origin/main", "--fixed-strings", "--grep=$subject", "--format=%H`t%s"); if ($since.Count) { $a += "--since=$($since[0])" }
+    # Compared here, not with git's --grep: Windows PowerShell mangles double quotes in a native command's arguments.
+    $a = @("log", "origin/main", "--format=%H`t%s"); if ($since.Count) { $a += "--since=$($since[0])" } else { $a += "-500" }
     $hit = @(Git-Lines $repo $a | Where-Object { ($_ -split "`t", 2)[1] -eq $subject } | Select-Object -Last 1)
     if ($hit.Count) { return @{ how = "copied"; commit = (([string]$hit[0]) -split "`t")[0] } }
   }
