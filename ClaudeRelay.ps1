@@ -12,7 +12,7 @@
 #    it remembers what came before. It works in its own folder, outside your
 #    projects, and only dispatches: every change, however small, goes to a
 #    subthread (up to 5 run at once), each in its own git worktree of one
-#    project, on its own branch (smokey/...; tyrone/... before 4.3), committed by the relay when it
+#    project, on its own branch (smokey/...; tyrone/... before 4.4.1), committed by the relay when it
 #    finishes and then closed. Nothing ever lands on the branch you work on.
 #    File edits are allowed; any command your project hasn't allowed is
 #    refused. Results go back to Smokey and your chat. Claude Code here needs
@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [switch]$Branches, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "4.4.0"
+$Version = "4.4.1"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -59,9 +59,9 @@ if (-not (Test-Path -LiteralPath $SmokeyFile) -and (Test-Path -LiteralPath $OldS
 # A relay from before 4.3 made it as "tyrone"; that folder stays in use, because Claude Code finds a thread's
 # session by the folder it ran in, and a new folder would start the thread afresh.
 $SmokeyHome = if (Test-Path -LiteralPath (Join-Path $Folder "tyrone")) { Join-Path $Folder "tyrone" } else { Join-Path $Folder "smokey" }
-# Branches made before 4.3 keep their tyrone/... names and are still followed. New ones are smokey/... once the app
-# is agreed to take them (BranchPrefix); the copies (worktrees) are local, so new ones are smokey- already.
-$BranchPrefix = "tyrone"
+# New branches are smokey/... (4.4.1, agreed with the app, which treats branch names as plain text); ones made
+# before keep their tyrone/... names and are still followed. New copies (worktrees) are smokey- too.
+$BranchPrefix = "smokey"
 $BranchPrefixes = @("smokey", "tyrone")
 $CopyPrefix = "smokey"
 # A subthread's copy of its project (or a go-live or undo copy): the one already there under either name, else a new smokey- one.
@@ -991,9 +991,9 @@ function Live-Body {
     if ($_.onMain) { $b.how = [string]$_.how; $b.commit = [string]$_.commit; $b.onDev = [bool]$_.onDev; $b.live = [bool]$_.live; if ($_.deploy) { $b.deploy = [string]$_.deploy } }
     $b
   })
-  # Sent as "smokey" and, until the app reads that, as "tyrone" too (the key the app read before the rename): the same report.
+  # Sent as "smokey" (4.4.1). Relays 4.3 to 4.4.0 also sent it as "tyrone" until the app read "smokey" (it does since e87e07b).
   $report = @{ version = $Version; state = $(if ($job) { "working" } else { "idle" }); job = $job; subthreads = $subs; max = $MaxSubthreads; branches = $branches }
-  return @{ smokey = $report; tyrone = $report }
+  return @{ smokey = $report }
 }
 
 $script:LastLive = ""; $script:LastLiveAt = [DateTime]::MinValue
