@@ -1,12 +1,15 @@
 ﻿# Wake listener: say "hey Tyrone" and your Project Check-in assistant opens.
 #
 # Plain PowerShell, no exe. The listening is done by listen.py (next to this
-# file) with sherpa-onnx keyword spotting: a small neural model trained on
-# thousands of hours of speech, so it hears the phrase from across the room and
-# over music, in anyone's voice, with nothing to train. It runs on this PC;
-# nothing is sent anywhere. The first run sets it up (Python, the engine and its
-# 17 MB model, in %LOCALAPPDATA%\WakeListener). When it hears the phrase it opens
-# the assistant's voice page, which starts talking.
+# file) in two stages, the way smart speakers work: a small keyword spotter
+# (sherpa-onnx) catches anything like the phrase, then a speech-to-text model
+# (Moonshine) checks the words before it opens. It runs on this PC; nothing is
+# sent anywhere. The first run sets it up (Python, the engine and its models,
+# about 125 MB, in %LOCALAPPDATA%\WakeListener). When it hears the phrase it
+# opens the assistant's voice page, which starts talking.
+#
+# Close calls go to heard.log there, and "He missed me just now" on the menu
+# keeps the last 8 seconds in its missed folder, for tuning it to your voice.
 #
 # The window shows what's going on: which microphone, a live level meter, and
 # each time it hears the phrase.
@@ -16,7 +19,7 @@
 
 param([switch]$Test)
 
-$Version = "6.4.0"
+$Version = "6.5.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Tyrone"   # what you'll say (two or three words work best)
@@ -416,13 +419,28 @@ foreach ($s in @(@("low", "Low: only when it's sure"), @("normal", "Normal"), @(
   })
   [void]$sensItem.MenuItems.Add($item)
 }
+# Close calls, and "it missed me": the last 8 seconds kept (on this PC) so it can be tuned to your voice and room.
+$HeardLog = Join-Path $EngineFolder "heard.log"
+function Write-Heard([string]$text) {
+  try {
+    Add-Content -Path $HeardLog -Value ((Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "  " + $text) -Encoding UTF8
+    if ((Get-Item $HeardLog).Length -gt 512KB) { $keep = Get-Content $HeardLog -Encoding UTF8 | Select-Object -Last 2000; Set-Content $HeardLog $keep -Encoding UTF8 }
+  } catch { }
+}
+$missedItem = New-Object System.Windows.Forms.MenuItem("He missed me just now (keep the last 8 seconds)")
+$missedItem.add_Click({
+  if (-not $script:ears) { Say "Not listening right now, so there's nothing to keep." Yellow; return }
+  try { Set-Content -Path (Join-Path $EngineFolder "missed.flag") -Value "" -Encoding ASCII } catch { }
+})
+$heardItem = New-Object System.Windows.Forms.MenuItem("Open what he heard (close calls)")
+$heardItem.add_Click({ if (-not (Test-Path $HeardLog)) { Write-Heard "Close calls and wakes are written here." }; Start-Process notepad.exe -ArgumentList "`"$HeardLog`"" })
 $setupItem = New-Object System.Windows.Forms.MenuItem("Set up the engine again")
 $setupItem.add_Click({ $script:setupRequested = $true; $script:setupForced = $true })
 $openItem = New-Object System.Windows.Forms.MenuItem("Open the assistant now")
 $openItem.add_Click({ try { Open-Assistant } catch { } })
 $quitItem = New-Object System.Windows.Forms.MenuItem("Quit (stop listening)")
 $quitItem.add_Click({ $script:quit = $true })
-$script:tray.ContextMenu = New-Object System.Windows.Forms.ContextMenu(,[System.Windows.Forms.MenuItem[]]@($script:showItem, $pauseItem, $sensItem, $openItem, $setupItem, (New-Object System.Windows.Forms.MenuItem("-")), $quitItem))
+$script:tray.ContextMenu = New-Object System.Windows.Forms.ContextMenu(,[System.Windows.Forms.MenuItem[]]@($script:showItem, $pauseItem, $sensItem, $missedItem, $heardItem, $openItem, $setupItem, (New-Object System.Windows.Forms.MenuItem("-")), $quitItem))
 $script:tray.add_DoubleClick({ Set-WindowShown $true })
 $script:lastHeard = ""
 function Set-TrayText {
@@ -742,7 +760,11 @@ function Test-Engine {
   if (-not (Test-Path $VenvPython)) { return $false }
   $marker = Join-Path $EngineFolder "packages.txt"
   if (-not (Test-Path $marker) -or (Get-Content $marker -Raw).Trim() -ne ($Packages -join " ")) { return $false }
-  return (Test-Path (Join-Path $EngineFolder "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01\tokens.txt"))
+  # The spotter, the speech check and the speech detector (listen.py's MODELS).
+  foreach ($f in @("sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01\tokens.txt", "sherpa-onnx-moonshine-base-en-quantized-2026-02-27\decoder_model_merged.ort", "silero_vad.int8.onnx")) {
+    if (-not (Test-Path (Join-Path $EngineFolder $f))) { return $false }
+  }
+  return $true
 }
 function Install-Engine {
   $null = New-Item -ItemType Directory -Force $EngineFolder
@@ -985,6 +1007,11 @@ while (-not $script:quit) {
         Say ("Listening on: " + $parts[1]) Green
         $script:micName = $parts[1]; Set-TrayText
         $host.UI.RawUI.WindowTitle = "Wake listener: listening on " + $parts[1]
+        # A Bluetooth headset's microphone is phone-call quality: say so once per microphone.
+        if ($parts[1] -match "Hands-Free|Headset|Bluetooth|\bBT\b|AG Audio" -and $script:btWarned -ne $parts[1]) {
+          $script:btWarned = $parts[1]
+          Say "That microphone sounds like Bluetooth, which sends phone-call-quality sound while it's listening. For the best hearing, plug it in by USB (or use its USB dongle)." DarkYellow
+        }
         $script:lastStartError = $null
       }
       "stalled" { Say "The microphone stopped sending sound: opening it again." DarkYellow; Stop-Listening; $restartAt = Get-Date }
@@ -994,6 +1021,21 @@ while (-not $script:quit) {
         Stop-Listening; $restartAt = (Get-Date).AddSeconds(5)
       }
       "stderr" { }
+      "heard" {
+        # The speech check's verdict on a close call: yes|no, how it got there, and the words.
+        $h = $parts[1].Split("|", 3)
+        $how = @{ sure = "spotter, sure"; spotter = "spotter"; speech = "speech" }[$h[1]]
+        $words = if ($h.Count -gt 2 -and $h[2]) { "`"" + $h[2] + "`"" } else { "(no words)" }
+        Write-Heard ($(if ($h[0] -eq "yes") { "Opened" } else { "Not opened" }) + " ($how): " + $words)
+        if ($h[0] -ne "yes") { Say ("Close, but not the phrase: " + $words) DarkGray }
+      }
+      "note" { Say $parts[1] DarkYellow; Write-Heard ("Note: " + $parts[1]) }
+      "saved" {
+        $h = $parts[1].Split("|", 2)
+        $words = if ($h.Count -gt 1 -and $h[1]) { "`"" + $h[1] + "`"" } else { "(no words)" }
+        Say ("Kept the last 8 seconds: " + $h[0] + ". It heard: " + $words) Green
+        Write-Heard ("Missed (you said so): " + $h[0] + "  heard " + $words)
+      }
       "wake" {
         if (((Get-Date) - $last).TotalSeconds -lt $GraceSecs) { Say "Heard `"$Phrase`": it's opening now, ignored." DarkGray }
         elseif (Test-AssistantOpen) { Say "Heard `"$Phrase`": the assistant is already open, ignored." DarkGray }

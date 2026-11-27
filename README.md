@@ -2,16 +2,16 @@
 
 Say **"hey Tyrone"** and your Project Check-in assistant opens and starts talking.
 
-Since 6.0 the listening is done by a **neural keyword engine** ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) keyword spotting). It's a small model trained on thousands of hours of real speech, so it hears the phrase from across the room and over music, in anyone's voice, with nothing to train. It runs on your PC; nothing is sent anywhere.
+Since 6.5 it listens in **two stages, the way smart speakers do**. A small keyword spotter ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)) catches anything like the phrase, and a voice detector passes on every short burst of speech. A speech-to-text model ([Moonshine](https://github.com/moonshine-ai/moonshine)) then checks the words before Tyrone opens. It runs on your PC; nothing is sent anywhere.
 
 ## Install
 
-1. Download the latest version from **[Releases](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest)**: the file named with its version, such as `WakeListener-6.3.1.zip` (`WakeListener.zip` there is the same file). Right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
+1. Download the latest version from **[Releases](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest)**: the file named with its version, such as `WakeListener-6.5.0.zip` (`WakeListener.zip` there is the same file). Right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
 2. Double-click **Start wake listener.cmd**. (If Windows asks about running it, choose **Run**.)
 3. **First run: it sets up the engine** (a few minutes, once, needs the internet). The activity window shows each step:
    - Python: it uses yours (3.11 to 3.14), or installs Python 3.12 from python.org for your Windows account only, through winget;
    - its own Python environment and the engine's packages (sherpa-onnx, sounddevice, numpy, sentencepiece), in `%LOCALAPPDATA%\WakeListener`;
-   - the 17 MB English model from sherpa-onnx's releases, checked against its published SHA-256 before it's used.
+   - three models from sherpa-onnx's releases (the 17 MB keyword spotter, the 106 MB speech-to-text check and a 0.2 MB voice detector), each checked against its SHA-256 before it's used. Updating from 6.4 or earlier downloads the two new ones once.
 4. Say **"hey Tyrone"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
 
 **Floating Tyrone** stays on top of every window, above the clock to start with:
@@ -29,6 +29,8 @@ It also runs as a **tray icon** by the clock. Hover it to see the microphone and
 - pause,
 - hide or show the floating button,
 - set the **sensitivity** (low, normal, high; it remembers your choice),
+- **He missed me just now**: keeps the last 8 seconds of sound (in `%LOCALAPPDATA%\WakeListener\missed`, on this PC only), with the words it heard in them, so it can be tuned to your voice and room,
+- **Open what he heard**: `heard.log`, every time it opened and every close call it turned down, with the words it heard (never your other talk),
 - open the assistant now,
 - set up the engine again,
 - check for updates,
@@ -46,8 +48,8 @@ While the assistant is open it lets go of the microphone, and takes it back when
 
 ## Getting the best from it
 
-- **Use the microphone over USB, not Bluetooth, if it has both.** While a Bluetooth headset or speakerphone has its mic on, it sends narrowband, phone-call-quality sound, which loses much of what the engine listens for. Over USB it sends full-quality sound.
-- **It misses you:** set the sensitivity to **High** from the tray icon.
+- **Use the microphone over USB, not Bluetooth, if it has both.** While a Bluetooth headset or speakerphone has its mic on, it sends narrowband, phone-call-quality sound, which loses much of what the engine listens for. Over USB it sends full-quality sound. The activity window says so when the microphone looks like Bluetooth.
+- **It misses you:** right after, choose **He missed me just now** from the menu. Then set the sensitivity to **High** if it keeps happening.
 - **It opens on other talk:** set it to **Low**.
 - Say it the way you'd say "Alexa": "hey Tyrone", then a short pause.
 
@@ -69,13 +71,31 @@ powershell -ExecutionPolicy Bypass -File WakeListener.ps1 -Test
 
 Windows' own voices say "hey Tyrone" at different speeds, some over loud music, and other things that come close ("Tyrone called about the permit", "my brother Tyrone", "hey there Ron", "hey Tony", "high tone"). Each recording goes through the engine the way the microphone's sound does: the phrase must open, the others mustn't. The engine has to be set up first, by starting the listener once.
 
+How 6.5 compares with 6.4, on 81 "hey Tyrone" recordings and 420 near misses (three Windows voices, three speeds, sound made to match each room):
+
+| Sound | 6.4 caught | 6.5 caught | False opens, 6.4 / 6.5 |
+|---|---|---|---|
+| Close to the mic | 93% | 99% | 3 / 3 |
+| Bluetooth (phone quality) | 88% | 96% | 1 / 1 |
+| Across a room | 49% | 80% | 6 / 5 |
+| Over music | 67% | 94% | 3 / 3 |
+| Across a room, with music | 26% | 60% | 4 / 4 |
+| Another room | 4% | 21% | 1 / 2 |
+
+The false opens all come from the 240 deliberately close phrases ("hey Tyrion", "hey, tie the rope", "hey Cairo"). None came from the 180 everyday ones.
+
 ## How it works
 
 - `WakeListener.ps1` is the tray app: it follows the default microphone, starts `listen.py`, reads what it prints, opens the assistant, and hands the microphone over while the assistant is open.
-- `listen.py` reads the microphone (sounddevice), evens out the level (slow automatic gain, so quiet or far-off talk is brought up), and runs sherpa-onnx's streaming keyword spotter on it. The phrase is turned into the model's word pieces when it starts, so another phrase works without retraining. "hi Tyrone" also counts.
-- The sensitivity sets the spotter's threshold and how strongly the phrase is favoured. "Normal" caught every test phrase, clean and over music, with no false opens over five minutes of tricky talk.
+- `listen.py` reads the microphone (sounddevice) and evens out the level (slow automatic gain, so quiet or far-off talk is brought up). Three things listen to it:
+  - **the spotter as before 6.5** (sherpa-onnx keyword spotting on the phrase's own spelling): opens unless the check's words are plainly something else;
+  - **the spotter set loose**, with sound-alike spellings of the name ("tie rone", "ty ron"): opens if the check's words have the name (or near it) at the start;
+  - **the voice detector** (Silero): every short burst of speech is checked, and opens only if the words clearly hold "hey" or "hi" right before the name. This catches the times the spotter misses.
+- **The check** is Moonshine's base English model: it turns the last couple of seconds into words in about 40 ms. Names come out spelled many ways ("Tyron", "Detyrone", "Hey, chiron"), so the words are compared by a rough sound key, and everyday words run together ("try one") don't count.
+- The sensitivity sets how loose the spotters are and how close the words must be.
 
 Earlier versions:
+- **6.0 to 6.4** used the keyword spotter alone. Good up close, but it missed most of the time across a room or over music.
 - **5.x** compared the microphone's sound with recordings of your voice. That couldn't cope with distance, music or a Bluetooth mic.
 - **Up to 4.x** used Windows' speech recognizers. They were inaccurate with a headset and, in the background, stopped hearing after the first call.
 
