@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [switch]$Branches, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "4.2.1"
+$Version = "4.2.2"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -877,10 +877,10 @@ function Check-Merged {
       $p = $line -split "`t"; $branch = $p[0]; $head = $p[1]
       $sub = $subs | Where-Object { $_.branch -eq $branch } | Select-Object -First 1
       $c = $cache["$($r.name)|$branch"]
-      # Settled ones aren't looked at again; others when the branch or main moved, or (on main) when dev or what's live may have.
-      if ($c -and $c.head -eq $head -and ($c.live -or ($c.mainTip -eq $mainTip -and -not $c.onMain))) { $out += $c; continue }
+      # Settled ones aren't looked at again (until a new relay version, which may judge them differently); others when the branch or main moved, or (on main) when dev or what's live may have.
+      if ($c -and [string]$c.v -eq $Version -and $c.head -eq $head -and ($c.live -or ($c.mainTip -eq $mainTip -and -not $c.onMain))) { $out += $c; continue }
       $hit = Find-OnMain $repo $branch $head $(if ($sub) { [string]$sub.base } else { "" })
-      $b = [ordered]@{ folder = $r.name; branch = $branch; head = $head; at = $p[2]; mainTip = $mainTip; onMain = [bool]$hit; checkedAt = (Get-Date).ToUniversalTime().ToString("o") }
+      $b = [ordered]@{ v = $Version; folder = $r.name; branch = $branch; head = $head; at = $p[2]; mainTip = $mainTip; onMain = [bool]$hit; checkedAt = (Get-Date).ToUniversalTime().ToString("o") }
       if ($hit) {
         $b.how = $hit.how; $b.commit = $hit.commit
         $b.onDev = Git-Ok $repo @("merge-base", "--is-ancestor", $hit.commit, $devTip)
