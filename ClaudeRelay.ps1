@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [switch]$Branches, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "4.1.0"
+$Version = "4.2.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -827,6 +827,13 @@ function Find-OnMain([string]$repo, [string]$branch, [string]$head, [string]$bas
     $hit = @(Git-Lines $repo $a | Select-Object -Last 1)
     if ($hit.Count) { return @{ how = "copied"; commit = [string]$hit[0] } }
   }
+  # A copy redone by hand on main that kept the branch's commit message word for word (4.2).
+  $subject = Git-One $repo @("log", "-1", "--format=%s", $head)
+  if ($subject.Length -ge 20) {
+    $a = @("log", "origin/main", "--fixed-strings", "--grep=$subject", "--format=%H`t%s"); if ($since.Count) { $a += "--since=$($since[0])" }
+    $hit = @(Git-Lines $repo $a | Where-Object { ($_ -split "`t", 2)[1] -eq $subject } | Select-Object -Last 1)
+    if ($hit.Count) { return @{ how = "copied"; commit = (([string]$hit[0]) -split "`t")[0] } }
+  }
   # The same changes, commit for commit (cherry-picked or rebased onto main).
   if ($base) {
     $ch = @(Git-Lines $repo @("cherry", "origin/main", $head, $base))
@@ -898,7 +905,21 @@ function Check-Merged {
     $sh = Read-Json (Ship-File $s.id "ship.json")
     if ($sh -and @("waiting", "going", "live") -contains [string]$sh.state) { continue }
     $b = $script:BranchList | Where-Object { $_.branch -eq $s.branch -and $_.onMain } | Select-Object -First 1
-    if (-not $b) { continue }
+    if (-not $b) {
+      # A job that couldn't go live whose branch was then deleted, here and on GitHub, without reaching main (4.2):
+      # it was dropped, usually for a later job or a hand-made copy, so it's no longer "still on the branch".
+      $repo = [string]$s.path
+      if (-not $sh -or [string]$sh.state -ne "failed" -or -not $repo -or -not (Test-Path -LiteralPath (Join-Path $repo ".git"))) { continue }
+      if (Git-Ok $repo @("rev-parse", "--verify", "-q", "refs/heads/$($s.branch)")) { continue }
+      if (Git-Ok $repo @("rev-parse", "--verify", "-q", "refs/remotes/origin/$($s.branch)")) { continue }
+      $file = Ship-File $s.id "merged.json"
+      $was = Read-Json $file
+      if ($was) { continue }
+      Write-Json $file ([pscustomobject][ordered]@{ state = "dropped"; how = "deleted"; commit = ""; at = (Get-Date).ToUniversalTime().ToString("o") })
+      Add-Note "Subthread $($s.id) `"$($s.title)`" ($($s.folder)) was dropped: its branch $($s.branch) was deleted without being merged."
+      Log "Subthread $($s.id) dropped: $($s.branch) deleted without reaching main."
+      continue
+    }
     $m = [ordered]@{ state = $(if ($b.live) { "live" } else { "merged" }); how = [string]$b.how; commit = [string]$b.commit }
     if ($b.onDev) { $m.onDev = $true }
     if ($b.deploy) { $m.deploy = [string]$b.deploy }
