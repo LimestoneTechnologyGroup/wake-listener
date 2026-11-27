@@ -22,7 +22,7 @@
 
 param([switch]$Test)
 
-$Version = "6.7.0"
+$Version = "6.8.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Smokey|hey Tyrone"   # what you'll say (two or three words work best); | between phrases for either
@@ -174,13 +174,75 @@ function Get-Microphone {
   return [pscustomobject]@{ Id = $d.Substring(0, $i); Name = $d.Substring($i + 1) }
 }
 
+# ---- What the window says about updates and SmokeMonitor (plain functions, checked by -Test) ----
+$MonitorName = "SmokeMonitor"   # the app's monitor, as the app names it
+# The notice strip for an update: @(text, kind). States: available, updating, updated, failed, or none.
+function Get-UpdateNotice([string]$state, [string]$to, [string]$current, [string]$why, [bool]$waiting) {
+  switch ($state) {
+    "available" { if ($waiting) { return @("Update available: $to. It installs when the assistant closes.", "update") } else { return @("Update available: $to. Click here to install it.", "update") } }
+    "updating" { return @("Updating to $to... not listening for a minute.", "updating") }
+    "updated" { return @("Updated to $current.", "updated") }
+    "failed" {
+      $w = $(if ($why) { $why.TrimEnd(".") + "." } else { "" })
+      return @("Update to $to didn't install. $w Still on ${current}: click to try again.", "failed")
+    }
+  }
+  return @("", "")
+}
+# SmokeMonitor's open incidents for the window: Notice (the strip, "" when all is well), Kind, and Lines for the
+# larger view. $data is the app's answer ({ allClear, open[], degraded[] }), or $null with $problem saying why.
+function Get-AlertView($data, [string]$problem, [string]$name, [datetime]$now) {
+  $lines = @()
+  if (-not $data) {
+    $lines += "#$name"; $lines += $(if ($problem) { "Couldn't check: $problem" } else { "Checking..." })
+    return @{ Notice = ""; Kind = ""; Lines = $lines }
+  }
+  $open = @($data.open | Where-Object { $_ })
+  $since = { param($i) try { ([datetime]$i.openedAt).ToLocalTime().ToString($(if (([datetime]$i.openedAt).ToLocalTime().Date -eq $now.Date) { "h:mm tt" } else { "ddd h:mm tt" })) } catch { "" } }
+  $sev = { param($i) if ($i.severityLabel) { $i.severityLabel } else { "$($i.severity)" } }
+  if (-not $open.Count) {
+    $lines += "#$name"; $lines += "All clear"
+    foreach ($d in @($data.degraded | Where-Object { $_ } | Select-Object -First 3)) { $lines += "Warning: $($d.checkName): $($d.detail)" }
+    return @{ Notice = ""; Kind = ""; Lines = $lines }
+  }
+  $lines += "#$name ($($open.Count) open)"
+  foreach ($i in @($open | Select-Object -First 6)) { $lines += ("$(& $sev $i): $($i.checkName) since $(& $since $i)" + $(if ($i.detail) { " ($($i.detail))" } else { "" })) }
+  if ($open.Count -gt 6) { $lines += "and $($open.Count - 6) more" }
+  $first = $open[0]
+  $notice = if ($open.Count -eq 1) { "${name}: $($first.checkName) is down ($(& $sev $first)) since $(& $since $first)" } else { "${name}: $($open.Count) open, worst $($first.checkName) ($(& $sev $first))" }
+  return @{ Notice = $notice; Kind = "alert"; Lines = $lines }
+}
+
 if ($Test) {
+  # The window's words for updates and SmokeMonitor (no engine needed).
+  $ok = $true
+  $t = [datetime]"2026-11-27T15:00:00"
+  $cases = @(
+    @("update available", ((Get-UpdateNotice "available" "6.8.1" "6.8.0" "" $false) -join "|"), "Update available: 6.8.1. Click here to install it.|update"),
+    @("update waits for the call", ((Get-UpdateNotice "available" "6.8.1" "6.8.0" "" $true) -join "|"), "Update available: 6.8.1. It installs when the assistant closes.|update"),
+    @("updating", ((Get-UpdateNotice "updating" "6.8.1" "6.8.0" "" $false) -join "|"), "Updating to 6.8.1... not listening for a minute.|updating"),
+    @("updated", ((Get-UpdateNotice "updated" "" "6.8.1" "" $false) -join "|"), "Updated to 6.8.1.|updated"),
+    @("update failed", ((Get-UpdateNotice "failed" "6.8.1" "6.8.0" "the download didn't match its checksum" $false) -join "|"), "Update to 6.8.1 didn't install. the download didn't match its checksum. Still on 6.8.0: click to try again.|failed"),
+    @("no update", ((Get-UpdateNotice "" "" "6.8.0" "" $false) -join "|"), "|"))
+  $inc = { param($n, $s, $at) [pscustomobject]@{ id = "i$n"; checkName = $n; severity = $s.ToLower(); severityLabel = $s; detail = "HTTP 503"; openedAt = $at } }
+  $one = [pscustomobject]@{ allClear = $false; open = @(& $inc "Kitchen site" "Critical" "2026-11-27T14:05:00"); degraded = @() }
+  $many = [pscustomobject]@{ allClear = $false; open = @(1..8 | ForEach-Object { & $inc "App $_" "Major" "2026-11-26T09:00:00" }); degraded = @() }
+  $clear = [pscustomobject]@{ allClear = $true; open = @(); degraded = @() }
+  $v = Get-AlertView $clear "" "SmokeMonitor" $t;  $cases += ,@("alerts: all clear", ($v.Notice + "|" + ($v.Lines -join "/")), "|#SmokeMonitor/All clear")
+  $v = Get-AlertView $one "" "SmokeMonitor" $t;    $cases += ,@("alerts: one", ($v.Notice + "|" + $v.Kind + "|" + $v.Lines.Count), ("SmokeMonitor: Kitchen site is down (Critical) since " + ([datetime]"2026-11-27T14:05:00").ToLocalTime().ToString("h:mm tt") + "|alert|2"))
+  $v = Get-AlertView $many "" "SmokeMonitor" $t;   $cases += ,@("alerts: many", ($v.Notice + "|" + $v.Lines.Count + "|" + $v.Lines[-1]), "SmokeMonitor: 8 open, worst App 1 (Major)|8|and 2 more")
+  $v = Get-AlertView $clear "" "SmokeMonitor" $t;  $cases += ,@("alerts: resolved (gone from the open list)", $v.Notice, "")
+  $v = Get-AlertView $null "Project Check-in didn't answer" "SmokeMonitor" $t; $cases += ,@("alerts: app unreachable", ($v.Notice + "|" + ($v.Lines -join "/")), "|#SmokeMonitor/Couldn't check: Project Check-in didn't answer")
+  foreach ($c in $cases) {
+    $good = $c[1] -ceq $c[2]
+    "{0,-8} {1}{2}" -f $(if ($good) { "ok" } else { "WRONG" }), $c[0], $(if ($good) { "" } else { "`n         got:      " + $c[1] + "`n         expected: " + $c[2] })
+    $ok = $ok -and $good
+  }
   # Windows' own voices say the phrase and other things, with room hiss, and
   # music under some; each recording goes through listen.py the way the
   # microphone's sound does. The phrase must open; other talk mustn't.
   if (-not (Test-Path $VenvPython)) { "engine: not set up in $EngineFolder; start the wake listener once to set it up"; exit 1 }
   Add-Type -AssemblyName System.Speech
-  $ok = $true
   $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
   $voices = @($synth.GetInstalledVoices() | Where-Object { $_.Enabled } | ForEach-Object { $_.VoiceInfo.Name })
   if (-not $voices) { "no Windows voices installed: can't run the voice checks"; exit 1 }
@@ -486,7 +548,10 @@ $script:pillColors = @{
 }
 $pill = New-Object WakeUi.Pill
 $pill.Expanded = ((Get-Setting "expanded") -eq "1")
-$pill.Display("Starting", $script:pillColors.setup, "", "", -1, "")
+$script:pillShapes = @{ listening = "circle"; open = "oncall"; connecting = "ring"; paused = "pause"; setup = "ring"; problem = "warning"; updating = "updating" }
+$script:pillColors.updating = $script:pillColors.setup
+$pill.Version = $Version
+$pill.Display("Starting", $script:pillColors.setup, "", "", -1, "", "ring")
 $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $at = New-Object System.Drawing.Point(($area.Right - $pill.Width - 24), ($area.Bottom - $pill.Height - 24))
 $placed = Get-Setting "button"
@@ -614,6 +679,33 @@ function Step-Glance {
   $web.Headers["Authorization"] = "Bearer $key"; $web.Headers["User-Agent"] = "WakeListener"; $web.Encoding = [Text.Encoding]::UTF8
   $script:glanceTask = $web.DownloadStringTaskAsync($GlanceUrl)
 }
+# SmokeMonitor's open incidents, once a minute while "Show SmokeMonitor alerts" is on (read only, with the same key).
+$MonitorUrl = ($Url -replace "/assistant.*$", "") + "/api/teams/messages/intake/monitor"
+$script:monitor = $null; $script:monitorProblem = ""; $script:monitorAt = [datetime]::MinValue; $script:monitorTask = $null
+function Step-Monitor {
+  if ((Get-Setting "monitor-alerts") -ne "yes") { $script:monitor = $null; return }
+  $t = $script:monitorTask
+  if ($t -and $t.IsCompleted) {
+    $script:monitorTask = $null
+    if ($t.Status -eq "RanToCompletion") {
+      try { $script:monitor = $t.Result | ConvertFrom-Json; $script:monitorProblem = ""; if ($script:monitor.name) { $script:MonitorName = [string]$script:monitor.name } }
+      catch { $script:monitor = $null; $script:monitorProblem = "the answer couldn't be read" }
+    } else {
+      $why = "$($t.Exception.InnerException)"
+      $script:monitor = $null
+      $script:monitorProblem = if ($why -match "401") { "the key was refused: connect again" } elseif ($why -match "403") { "your account can't see $MonitorName" } elseif ($why -match "404") { "this needs a newer Project Check-in" } else { "Project Check-in didn't answer" }
+    }
+    $t.Dispose()
+  }
+  if ($script:monitorTask -or ((Get-Date) - $script:monitorAt).TotalSeconds -lt 60) { return }
+  $key = Get-Key
+  if (-not $key) { $script:monitorProblem = "connect to Project Check-in first (click the button)"; return }
+  $script:monitorAt = Get-Date
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  $web = New-Object System.Net.WebClient
+  $web.Headers["Authorization"] = "Bearer $key"; $web.Headers["User-Agent"] = "WakeListener"; $web.Encoding = [Text.Encoding]::UTF8
+  $script:monitorTask = $web.DownloadStringTaskAsync($MonitorUrl)
+}
 function Get-GlanceLine {
   $shown = Get-Shown
   if (-not $shown.Count) { return "" }
@@ -657,7 +749,8 @@ function Get-GlanceDetails {
 
 # Puts the current state on the button.
 function Update-Pill {
-  $state, $word = if ($script:setupNeeded) { "setup", "Setting up" }
+  $state, $word = if ($script:updateState -eq "updating") { "updating", ("Updating to " + $script:update.Version + "...") }
+    elseif ($script:setupNeeded) { "setup", "Setting up" }
     elseif ($script:assistantOpen -and $script:onCall) { "open", "On a call" }
     elseif ($script:assistantOpen) { "connecting", "Connecting" }
     elseif ($script:paused) { "paused", "Paused" }
@@ -665,13 +758,22 @@ function Update-Pill {
     elseif ($script:lastStartError -and -not $script:micName) { "problem", "Engine stopped" }   # a mic, but listen.py failed
     elseif (-not $script:micName -or -not $script:ears) { "setup", "Starting" }
     else { "listening", "Sleeping" }
-  $action = if ($script:setupNeeded) { "" } elseif ($script:assistantOpen) { "Stop" } else { "Start" }
+  $action = if ($script:setupNeeded -or $state -eq "updating") { "" } elseif ($script:assistantOpen) { "Stop" } else { "Start" }
   $lvl = if ($state -eq "listening") { [int]([Math]::Round([Math]::Min(100, [Math]::Max(0, $script:level)) / 10) * 10) } else { -1 }
-  if ($pill.Visible) { $pill.Display($word, $script:pillColors[$state], (Get-GlanceLine), $action, $lvl, (Get-GlanceDetails)) }
+  # The notice strip: an update first (it needs him), else an open SmokeMonitor incident.
+  if ($script:updateState -eq "updated" -and (Get-Date) -gt $script:updatedUntil) { $script:updateState = $null }
+  $to = if ($script:update) { [string]$script:update.Version } else { "" }
+  $note = Get-UpdateNotice $script:updateState $to $Version $script:updateWhy ([bool]$script:assistantOpen)
+  $alerts = if ((Get-Setting "monitor-alerts") -eq "yes") { Get-AlertView $script:monitor $script:monitorProblem $MonitorName (Get-Date) } else { $null }
+  if (-not $note[0] -and $alerts) { $note = @($alerts.Notice, $alerts.Kind) }
+  $details = Get-GlanceDetails
+  if ($alerts) { $details = $details + "`n" + ($alerts.Lines -join "`n") }
+  if ($pill.Visible) { $pill.SetNotice($note[0], $note[1]); $pill.Display($word, $script:pillColors[$state], (Get-GlanceLine), $action, $lvl, $details, $script:pillShapes[$state]) }
 }
 # What was done with it.
 function Step-Pill {
   Step-Glance
+  Step-Monitor
   $click = $null
   while ($pill.Clicks.TryDequeue([ref]$click)) {
     switch -Wildcard ($click) {
@@ -688,6 +790,7 @@ function Step-Pill {
       "menu" { $script:tray.ContextMenu.Show($pill, $pill.PointToClient([System.Windows.Forms.Cursor]::Position)) }
       "moved|*" { Set-Setting "button" $click.Substring(6) }
       "expanded|*" { Set-Setting "expanded" $click.Substring(9); $script:glanceAt = [datetime]::MinValue }
+      "notice" { if ($script:updateState -in @("available", "failed")) { $script:updateNow = $true } }
     }
   }
   if ($script:connectRequested) { $script:connectRequested = $false; Connect-App }
@@ -866,23 +969,61 @@ function Restart-Listener {
 }
 $script:nextUpdateCheck = (Get-Date).AddSeconds(30)
 $script:updateNow = $false
+# The window shows each step: "Update available" (click to install; with auto-update=no it waits for that click),
+# "Updating to X..." (listening stops for the minute it takes), then "Updated to X" for two minutes after it starts
+# again, or "didn't install", why, and that the old version is still running (click to retry). It never updates
+# while the assistant is open: the main loop doesn't get here until it closes.
+$script:update = $null; $script:updateState = $null; $script:updateWhy = ""; $script:updatedUntil = [datetime]::MinValue
+$updatedFile = Join-Path $EngineFolder "updated.txt"
+if (Test-Path $updatedFile) {
+  $was = (Get-Content $updatedFile -Raw -ErrorAction SilentlyContinue) -split "\|"
+  Remove-Item $updatedFile -Force -ErrorAction SilentlyContinue
+  if ($was.Count -ge 2 -and $was[1].Trim() -eq $Version) { $script:updateState = "updated"; $script:updatedUntil = (Get-Date).AddMinutes(2) }
+}
 function Step-Update([bool]$asked) {
-  $script:nextUpdateCheck = (Get-Date).AddHours(24)
-  if ($env:WAKE_LISTENER_FAKE_MIC -or ((Get-Setting "auto-update") -eq "no" -and -not $asked)) { return }
+  $script:nextUpdateCheck = (Get-Date).AddHours(6)
+  if ($env:WAKE_LISTENER_FAKE_MIC) { return }
   try { $u = Find-Update } catch { if ($asked) { Say ("Couldn't check for updates: " + (Why $_)) Yellow }; return }
-  if (-not $u) { if ($asked) { Say "You have the latest version ($Version)." Green }; return }
-  Say ("Updating to " + $u.Version + "...") Cyan
+  if (-not $u) {
+    $script:update = $null; if ($script:updateState -in @("available", "failed")) { $script:updateState = $null }
+    if ($asked) { Say "You have the latest version ($Version)." Green }
+    return
+  }
+  $script:update = $u
+  if (-not $asked -and (Get-Setting "auto-update") -eq "no") {
+    if ($script:updateState -ne "available") { Say ("Update available: " + $u.Version + ". Click the notice on the button to install it.") Cyan }
+    $script:updateState = "available"; Update-Pill
+    return
+  }
+  $script:updateState = "updating"; $script:updateWhy = ""
+  Stop-Listening
+  Update-Pill; [System.Windows.Forms.Application]::DoEvents()
+  Say ("Updating to " + $u.Version + ": not listening for the minute it takes.") Cyan
   try {
     if (Install-Update $u $PSScriptRoot) {
+      Set-Content -Path $updatedFile -Value ($Version + "|" + $u.Version) -Encoding ASCII
       Say ("Updated to " + $u.Version + ": starting it again.") Green
       $script:tray.ShowBalloonTip(5000, "Wake listener updated", ("Now on " + $u.Version + ". It's starting again."), [System.Windows.Forms.ToolTipIcon]::Info)
       Restart-Listener
     }
-  } catch { Say ("The update to " + $u.Version + " didn't install: " + (Why $_) + " It'll try again tomorrow, or choose 'Check for updates' from the tray icon.") Yellow }
+  } catch {
+    $script:updateState = "failed"; $script:updateWhy = (Why $_)
+    Say ("The update to " + $u.Version + " didn't install: " + $script:updateWhy + " Still on $Version and listening again. Click the notice on the button to try again, or it tries in 6 hours.") Yellow
+  }
 }
 $updateItem = New-Object System.Windows.Forms.MenuItem("Check for updates")
 $updateItem.add_Click({ $script:updateNow = $true })
 $script:tray.ContextMenu.MenuItems.Add($script:tray.ContextMenu.MenuItems.Count - 2, $updateItem) | Out-Null
+# Off unless chosen: open incidents and outages on the button (visual only; SmokeMonitor already messages and calls).
+$monitorItem = New-Object System.Windows.Forms.MenuItem("Show $MonitorName alerts")
+$monitorItem.Checked = ((Get-Setting "monitor-alerts") -eq "yes")
+$monitorItem.add_Click({
+  $on = -not $monitorItem.Checked; $monitorItem.Checked = $on
+  Set-Setting "monitor-alerts" $(if ($on) { "yes" } else { "no" })
+  $script:monitorAt = [datetime]::MinValue
+  Say $(if ($on) { "$MonitorName alerts: on. Open incidents show on the button." } else { "$MonitorName alerts: off." }) DarkGray
+})
+$script:tray.ContextMenu.MenuItems.Add($script:tray.ContextMenu.MenuItems.Count - 2, $monitorItem) | Out-Null
 
 # The version, at the top of the menu (the tray icon's and Floating Smokey's).
 $versionItem = New-Object System.Windows.Forms.MenuItem("Wake listener $Version")
@@ -968,7 +1109,7 @@ while (-not $script:quit) {
     continue
   }
 
-  # A newer version: on start, once a day, or when asked from the tray.
+  # A newer version: on start, every 6 hours, or when asked (the tray, or the notice on the button).
   if ($script:updateNow -or (Get-Date) -ge $script:nextUpdateCheck) {
     $asked = $script:updateNow; $script:updateNow = $false
     Step-Update $asked

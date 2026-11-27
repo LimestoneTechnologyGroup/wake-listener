@@ -6,7 +6,7 @@ Since 6.5 it listens in **two stages, the way smart speakers do**. A small keywo
 
 ## Install
 
-1. Download the latest version from **[Releases](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest)**: the file named with its version, such as `WakeListener-6.7.0.zip` (`WakeListener.zip` there is the same file). Right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
+1. Download the latest version from **[Releases](https://github.com/LimestoneTechnologyGroup/wake-listener/releases/latest)**: the file named with its version, such as `WakeListener-6.8.0.zip` (`WakeListener.zip` there is the same file). Right-click it, **Extract All**, and put the folder somewhere it can stay, such as Documents. (From 6.1 on it updates itself. Updating from an older version by hand: Quit from the tray first, then extract over the same folder.)
 2. Double-click **Start wake listener.cmd**. (If Windows asks about running it, choose **Run**.)
 3. **First run: it sets up the engine** (a few minutes, once, needs the internet). The activity window shows each step:
    - Python: it uses yours (3.11 to 3.14), or installs Python 3.12 from python.org for your Windows account only, through winget;
@@ -15,7 +15,8 @@ Since 6.5 it listens in **two stages, the way smart speakers do**. A small keywo
 4. Say **"hey Smokey"**: an Edge app window opens on the assistant and the voice starts. The first time, allow the microphone for the site, and sign in if asked.
 
 **Floating Smokey** stays on top of every window, above the clock to start with:
-- a dot and a word say how Smokey is: green **Sleeping** (waiting for "hey Smokey", with a small bar that moves with your voice), blue **On a call** (only while a conversation is actually connected), light blue **Connecting**, grey **Paused**, amber **Setting up**, red **No microphone** (Windows has no recording device: it picks one up within a few seconds of it appearing), red **Engine stopped** (there's a microphone, but the listening engine failed: the activity window says why, and it keeps retrying);
+- a word and a shape (never colour alone; since 6.8) say how Smokey is: a filled circle **Sleeping** (waiting for "hey Smokey", with a small bar that moves with your voice), a circle in a ring **On a call** (only while a conversation is actually connected), a ring **Connecting**, **Starting** or **Setting up**, two bars **Paused**, a down arrow **Updating to 6.8.1...**, a warning triangle **No microphone** (Windows has no recording device: it picks one up within a few seconds of it appearing) or **Engine stopped** (there's a microphone, but the listening engine failed: the activity window says why, and it keeps retrying). The version it's running is the small number after the word;
+- a strip along the bottom when something needs you (since 6.8): **Update available: 6.8.1. Click here to install it.**, **Updating to 6.8.1... not listening for a minute.**, **Updated to 6.8.1.** (for two minutes), or **Update to 6.8.1 didn't install**, why, and that the old version is still running (click it to try again). With **Show SmokeMonitor alerts** on, an open incident shows there too ("SmokeMonitor: Kitchen site is down (Critical) since 2:05 PM"), and the larger view lists every open one under a SmokeMonitor heading, or "All clear". Updates come first, since they need you;
 - **the arrow** next to Start/Stop opens a **larger view**: each item you chose under its own heading, in full (today's to-dos with the late ones marked, your Kitchen orders, your next meeting with its time, your last talk with what was done). Click it again to go back to the small button; it remembers which you like;
 - **Start** opens Smokey; **Stop** ends the conversation the same way End discussion does, so it's saved (the page ends it on Escape);
 - under it, what you choose from **Show on the button**: to-dos due today, Kitchen orders, your next meeting, your last talk with Smokey. The first time, **click the button** (or right-click > Show on the button > Connect to Project Check-in): a Project Check-in page opens, you press **Connect**, and it hands the listener a key on this PC. The key is kept encrypted for your Windows account only, and you can revoke it on the Datalink page. (Or paste a key yourself: right-click > Show on the button > Paste a key instead.);
@@ -34,9 +35,10 @@ It also runs as a **tray icon** by the clock. Hover it to see the microphone and
 - open the assistant now,
 - set up the engine again,
 - check for updates,
+- **Show SmokeMonitor alerts** (off unless you turn it on): open incidents and outages from SmokeMonitor on the button, read once a minute with the same key as your day, and cleared when they resolve. It only shows them: no sound or flashing, since SmokeMonitor already messages and calls for alerts,
 - quit.
 
-**Updates install themselves** (since 6.1): on start and once a day it checks for a newer release, checks the download's SHA-256, installs it over these files and starts again. Never while the assistant is open. To turn that off, add a line `auto-update=no` to `%LOCALAPPDATA%\WakeListener\settings.txt`; "Check for updates" on the menu still works.
+**Updates install themselves** (since 6.1): on start and every 6 hours (since 6.8; one small request to GitHub) it checks for a newer release, checks the download's SHA-256, installs it over these files and starts again. The button shows each step (above). Never while the assistant is open: it waits until it closes. Listening stops for the minute an update takes. To install only when you click, add a line `auto-update=no` to `%LOCALAPPDATA%\WakeListener\settings.txt`: the button then shows "Update available" until you click it, and "Check for updates" on the menu still works.
 
 While the assistant is open it lets go of the microphone, and takes it back when the assistant closes.
 

@@ -13,7 +13,11 @@ namespace WakeUi {
   /// (layered) window, so its edges are smooth and it never flickers. It only
   /// redraws when what it shows changes. What you do with it comes out as
   /// events: "start", "stop", "front", "activity", "menu", "moved|x,y",
-  /// "expanded|1" or "expanded|0" (the arrow opens and closes the larger view).
+  /// "expanded|1" or "expanded|0" (the arrow opens and closes the larger view),
+  /// "notice" (the notice strip at the bottom was clicked: install or retry an update).
+  /// The state is a word and a shape (never colour alone): circle Sleeping,
+  /// circle in a ring On a call, ring Connecting/Starting/Setting up, two bars
+  /// Paused, triangle with "!" a problem, down arrow Updating.
   /// </summary>
   public class Pill : Form {
     public readonly ConcurrentQueue<string> Clicks = new ConcurrentQueue<string>();
@@ -23,7 +27,10 @@ namespace WakeUi {
     Color dot = Color.FromArgb(251, 191, 36);
     int level = -1;
     float scale = 1f;
-    Rectangle actionBox = Rectangle.Empty, arrowBox = Rectangle.Empty;
+    Rectangle actionBox = Rectangle.Empty, arrowBox = Rectangle.Empty, noticeBox = Rectangle.Empty;
+    string shape = "ring", notice = "", noticeKind = "";
+    /// <summary>The running version, drawn small after the status word.</summary>
+    public string Version = "";
     Point downAt; bool dragging, down;
 
     [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref Point pptDst, ref Size psize, IntPtr hdcSrc, ref Point pptSrc, int crKey, ref Blend pblend, int dwFlags);
@@ -47,10 +54,47 @@ namespace WakeUi {
     /// <summary>What it shows. Redraws only when something changed.</summary>
     /// <param name="details">The larger view's lines, one per line; a line starting "#" is a heading.</param>
     public void Display(string status, Color dot, string info, string action, int level, string details) {
-      details = details ?? "";
-      if (status == this.status && dot == this.dot && info == this.info && action == this.action && level == this.level && details == this.details && Visible) return;
-      this.status = status; this.dot = dot; this.info = info ?? ""; this.action = action ?? ""; this.level = level; this.details = details;
+      Display(status, dot, info, action, level, details, shape);
+    }
+    /// <param name="shape">circle, oncall, ring, pause, warning or updating.</param>
+    public void Display(string status, Color dot, string info, string action, int level, string details, string shape) {
+      details = details ?? ""; shape = shape ?? "ring";
+      if (status == this.status && dot == this.dot && info == this.info && action == this.action && level == this.level && details == this.details && shape == this.shape && Visible) return;
+      this.status = status; this.dot = dot; this.info = info ?? ""; this.action = action ?? ""; this.level = level; this.details = details; this.shape = shape;
       Render();
+    }
+    /// <summary>A line along the bottom that stays until cleared: kind "update" (click installs), "updating",
+    /// "updated", "failed" (click retries), "alert" (a SmokeMonitor incident) or "" for a plain note.</summary>
+    public void SetNotice(string text, string kind) {
+      text = text ?? ""; kind = kind ?? "";
+      if (text == notice && kind == noticeKind) return;
+      notice = text; noticeKind = kind;
+      if (Visible) Render();
+    }
+    public string Notice { get { return notice; } }
+    public string NoticeKind { get { return noticeKind; } }
+
+    // The state's shape, in the dot's colour, centred on (cx, cy).
+    void DrawShape(Graphics g, string kind, Color c, float cx, float cy) {
+      float r = S(6);
+      using (var b = new SolidBrush(c))
+      using (var pen = new Pen(c, Math.Max(2f, 2.2f * scale))) {
+        switch (kind) {
+          case "circle": g.FillEllipse(b, cx - r, cy - r, 2 * r, 2 * r); break;
+          case "oncall": g.FillEllipse(b, cx - r * 0.6f, cy - r * 0.6f, 1.2f * r, 1.2f * r); g.DrawEllipse(pen, cx - r - S(1), cy - r - S(1), 2 * r + S(2), 2 * r + S(2)); break;
+          case "pause": g.FillRectangle(b, cx - r * 0.85f, cy - r, r * 0.6f, 2 * r); g.FillRectangle(b, cx + r * 0.25f, cy - r, r * 0.6f, 2 * r); break;
+          case "warning":
+            g.FillPolygon(b, new[] { new PointF(cx, cy - r - S(1)), new PointF(cx + r + S(1), cy + r), new PointF(cx - r - S(1), cy + r) });
+            using (var mark = new Pen(Color.FromArgb(22, 48, 80), Math.Max(1.5f, 1.8f * scale))) { g.DrawLine(mark, cx, cy - r * 0.35f, cx, cy + r * 0.25f); g.DrawLine(mark, cx, cy + r * 0.55f, cx, cy + r * 0.7f); }
+            break;
+          case "updating":
+            pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round;
+            g.DrawLine(pen, cx, cy - r, cx, cy + r * 0.6f);
+            g.DrawLines(pen, new[] { new PointF(cx - r * 0.7f, cy), new PointF(cx, cy + r * 0.75f), new PointF(cx + r * 0.7f, cy) });
+            break;
+          default: g.DrawEllipse(pen, cx - r + S(1), cy - r + S(1), 2 * r - S(2), 2 * r - S(2)); break;  // ring
+        }
+      }
     }
 
     int S(float v) { return (int)Math.Round(v * scale); }
@@ -63,6 +107,17 @@ namespace WakeUi {
         bool showInfo = !Expanded && info.Length > 0;
         int w = S(Expanded ? 320 : showInfo ? 270 : 240);
         int h = Expanded ? S(58) + lines.Length * S(19) + S(10) : S(showInfo ? 66 : 50);
+        int top = h;  // where the notice strip starts
+        // The notice wraps to a second line rather than cutting off what it says.
+        int noticeLines = 0;
+        if (notice.Length > 0) {
+          using (var tmp = new Bitmap(1, 1)) using (var mg = Graphics.FromImage(tmp))
+          using (var nf = new Font("Segoe UI Semibold", 9f * 96f / 72f * scale, GraphicsUnit.Pixel))
+            noticeLines = Math.Min(3, (int)Math.Ceiling(mg.MeasureString("!  " + notice, nf).Width * 1.1f / (w - S(30))));
+          noticeLines = Math.Max(1, noticeLines);
+          h += S(30) + (noticeLines - 1) * S(16);
+        }
+        bool twoLines = noticeLines > 1;
         using (var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb))
         using (var g = Graphics.FromImage(bmp)) {
           g.SmoothingMode = SmoothingMode.AntiAlias; g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
@@ -72,13 +127,17 @@ namespace WakeUi {
           using (var edge = new Pen(Color.FromArgb(90, 148, 163, 184), Math.Max(1, scale))) { g.FillPath(fill, path); g.DrawPath(edge, path); }
           // The status dot, with a soft halo.
           using (var halo = new SolidBrush(Color.FromArgb(60, dot))) g.FillEllipse(halo, S(12), S(15), S(20), S(20));
-          using (var b = new SolidBrush(dot)) g.FillEllipse(b, S(16), S(19), S(12), S(12));
+          DrawShape(g, shape, dot, S(22), S(25));
           using (var tf = new Font("Segoe UI Semibold", 10.5f * 96f / 72f * scale, GraphicsUnit.Pixel))
           using (var sf = new Font("Segoe UI", 8.75f * 96f / 72f * scale, GraphicsUnit.Pixel))
           using (var bf = new Font("Segoe UI Semibold", 9f * 96f / 72f * scale, GraphicsUnit.Pixel)) {
             g.DrawString(title, tf, Brushes.White, S(38), S(5));
             using (var muted = new SolidBrush(Color.FromArgb(203, 213, 225))) {
               g.DrawString(status, sf, muted, S(39), S(26));
+              if (Version.Length > 0)
+                using (var vf = new Font("Segoe UI", 7.5f * 96f / 72f * scale, GraphicsUnit.Pixel))
+                using (var dim = new SolidBrush(Color.FromArgb(148, 163, 184)))
+                  g.DrawString(Version, vf, dim, S(39) + g.MeasureString(status, sf).Width + S(4), S(28));
               var one = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
               if (showInfo) g.DrawString(info, sf, muted, new RectangleF(S(14), S(45), w - S(24), S(18)), one);
               // The larger view: a rule, then each line (headings in small capitals).
@@ -95,6 +154,25 @@ namespace WakeUi {
                   }
                 }
               }
+            }
+            // The notice strip: a symbol and words as well as a colour, so it reads without colour.
+            noticeBox = Rectangle.Empty;
+            if (notice.Length > 0) {
+              var box = new Rectangle(S(8), top, w - S(16), S(24) + (noticeLines - 1) * S(16));
+              Color tint; string mark;
+              switch (noticeKind) {
+                case "update": tint = Color.FromArgb(37, 99, 235); mark = "\u2193"; break;       // down arrow
+                case "updating": tint = Color.FromArgb(161, 98, 7); mark = "\u21BB"; break;      // circling arrow
+                case "updated": tint = Color.FromArgb(21, 128, 61); mark = "\u2713"; break;      // tick
+                case "failed": tint = Color.FromArgb(185, 28, 28); mark = "!"; break;
+                case "alert": tint = Color.FromArgb(185, 28, 28); mark = "\u26A0"; break;       // warning sign
+                default: tint = Color.FromArgb(71, 85, 105); mark = "\u2022"; break;
+              }
+              using (var np = Round(box, S(8))) using (var nb = new SolidBrush(tint)) g.FillPath(nb, np);
+              var wrap = new StringFormat { Trimming = StringTrimming.EllipsisWord, LineAlignment = StringAlignment.Center };
+              if (!twoLines) wrap.FormatFlags = StringFormatFlags.NoWrap;
+              g.DrawString(mark + "  " + notice, bf, Brushes.White, new RectangleF(box.X + S(8), box.Y + S(1), box.Width - S(14), box.Height - S(2)), wrap);
+              if (noticeKind == "update" || noticeKind == "failed") noticeBox = box;
             }
             // The mic level, a thin bar under the title, while listening.
             if (level >= 0) {
@@ -168,11 +246,12 @@ namespace WakeUi {
       down = false;
       if (dragging) { Clicks.Enqueue("moved|" + Left + "," + Top); return; }
       if (actionBox.Contains(e.Location)) Clicks.Enqueue(action == "Stop" ? "stop" : "start");
+      else if (noticeBox.Contains(e.Location)) Clicks.Enqueue("notice");
       else if (arrowBox.Contains(e.Location)) { Expanded = !Expanded; Clicks.Enqueue("expanded|" + (Expanded ? "1" : "0")); Render(); }
       else Clicks.Enqueue("front");
     }
     protected override void OnMouseDoubleClick(MouseEventArgs e) {
-      if (e.Button == MouseButtons.Left && !actionBox.Contains(e.Location) && !arrowBox.Contains(e.Location)) Clicks.Enqueue("activity");
+      if (e.Button == MouseButtons.Left && !actionBox.Contains(e.Location) && !arrowBox.Contains(e.Location) && !noticeBox.Contains(e.Location)) Clicks.Enqueue("activity");
     }
   }
 
