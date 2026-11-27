@@ -38,7 +38,7 @@
 param([switch]$Connect, [switch]$Doctor, [switch]$DryRun, [switch]$Once, [switch]$Install, [switch]$Uninstall, [switch]$Branches, [string]$Ship = "", [string]$Undo = "", [string]$Base = "https://project-checkin.dev.limestonetg.com")
 
 $ErrorActionPreference = "Stop"
-$Version = "4.3.0"
+$Version = "4.4.0"
 # CLAUDE_RELAY_HOME and CLAUDE_RELAY_CLAUDE are for testing: another folder for its files, another Claude Code.
 $Folder = if ($env:CLAUDE_RELAY_HOME) { $env:CLAUDE_RELAY_HOME } else { Join-Path $env:LOCALAPPDATA "ClaudeRelay" }
 $KeyFile = Join-Path $Folder "key.txt"
@@ -480,7 +480,7 @@ function Take-Spawns {
   }
 }
 
-function Close-Worktree($s) {
+function Close-Worktree($s, [bool]$discard = $false) {
   # Git writes notices (line endings, "Preparing worktree") to stderr; they mustn't stop the relay halfway.
   $ErrorActionPreference = "Continue"
   if (-not $s.worktree) { return }
@@ -488,7 +488,8 @@ function Close-Worktree($s) {
   $leftover = $false
   if (Test-Path -LiteralPath $wt) {
     # Anything the subthread didn't commit itself (its checks didn't pass, or it stopped) is still kept on its branch, marked as such.
-    if (@(& git -C $wt status --porcelain 2>$null).Count) {
+    # A dropped build's unfinished work is discarded instead (the copy is removed with it); its own commits stay.
+    if (-not $discard -and @(& git -C $wt status --porcelain 2>$null).Count) {
       & git -C $wt add -A 2>$null | Out-Null
       & git -C $wt commit -q -m "Smokey subthread (not committed by it; checks may not pass): $($s.title)" 2>$null | Out-Null
       $leftover = $true
@@ -963,6 +964,7 @@ function Live-Body {
   # Grouped explicitly: in PowerShell -and and -or bind equally, left to right, so without the brackets a finished
   # subthread whose going live was noted (ship.told) was left out, and the app never heard it went live (4.0.1).
   $subs = @(Get-Subthreads | Where-Object {
+    if ($_.state -eq "dropped") { return $false }
     $active = @("queued", "working", "asking", "parked") -contains [string]$_.state
     $recent = [bool]($_.finishedAt -and [DateTime]::Parse([string]$_.finishedAt).ToUniversalTime() -gt $day)
     $shipping = (Test-Path -LiteralPath (Ship-File $_.id "ship.pid")) -and -not (Test-Path -LiteralPath (Ship-File $_.id "ship.told"))
@@ -1014,6 +1016,20 @@ function Find-Sub([string]$sid, [string]$item) {
   return $hit
 }
 
+# Drops a build that hasn't finished: its Claude Code run stops, its copy goes (unfinished work discarded), a branch
+# with commits of its own is kept and an empty one deleted, and it's marked dropped: not counted, not reported to the
+# app (which already cleared it), and not tried again.
+function Drop-Sub($s) {
+  $ErrorActionPreference = "Continue"
+  if ($s.pid) { Stop-Process -Id ([int]$s.pid) -Force -ErrorAction SilentlyContinue }
+  $s.state = "dropped"
+  $s | Add-Member -Force finishedAt ((Get-Date).ToUniversalTime().ToString("o"))
+  $s | Add-Member -Force result "Dropped by its owner."
+  Save-Sub $s
+  if ($s.branch) { Close-Worktree $s $true }
+  Log "Build $($s.id) dropped$(if ($s.kept) { ": its $($s.commits) commit(s) stay on $($s.branch)" } elseif ($s.branch) { ': its empty branch was deleted' } else { '' })."
+}
+
 function Take-Build($key, $t) {
   $b = $t.claude.build; $id = [string]$t.id
   $dir = Join-Path $JobsDir $id
@@ -1052,6 +1068,13 @@ function Take-Build($key, $t) {
       Set-Content -LiteralPath (Ship-File $s.id "undo.pid") -Value $p.Id
       & $finish $true "Taking it back out."
       Log "Build $($s.id) being undone."
+    }
+    "drop" {
+      # Dropped by its owner (4.4): stopped and closed, its place freed, never reported again or tried again.
+      $s = Find-Sub ([string]$b.sub) ([string]$b.itemId)
+      if (-not $s -or @("queued", "working", "asking", "parked") -notcontains [string]$s.state) { & $finish $true "Nothing to drop: no unfinished build of it on this PC."; Log "Drop $id`: nothing unfinished to drop."; return }
+      Drop-Sub $s
+      & $finish $true "Dropped$(if ($s.kept) { "; its $($s.commits) commit(s) stay on $($s.branch)" } else { '' })."
     }
     default { & $finish $false "Unknown build step." }
   }
