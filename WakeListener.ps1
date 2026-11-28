@@ -22,7 +22,7 @@
 
 param([switch]$Test)
 
-$Version = "6.9.0"
+$Version = "6.9.1"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Smokey|hey Tyrone"   # what you'll say (two or three words work best); | between phrases for either
@@ -1141,6 +1141,10 @@ while (-not $script:quit) {
       $handedOver = $true; $script:assistantOpen = $true
       try { Open-Assistant } catch { Say ("Couldn't open the assistant: " + $_.Exception.Message) Red }
       continue
+    } elseif (Test-AssistantOpen) {
+      # Already open (on a call, or saving): show that window. Never a second conversation beside the first.
+      if (Show-Assistant) { $script:keepShown = $true }
+      Say "Smokey's window is already open: showing it instead of starting another." DarkGray
     } elseif (-not $needSetup) { try { Open-Assistant } catch { } }
   }
   # Setting up the engine: on the first run, and when asked from the tray.
