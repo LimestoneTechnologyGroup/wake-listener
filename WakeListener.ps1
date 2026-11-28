@@ -22,7 +22,7 @@
 
 param([switch]$Test)
 
-$Version = "6.8.0"
+$Version = "6.9.0"
 
 # ---- Settings ---------------------------------------------------------------
 $Phrase        = "hey Smokey|hey Tyrone"   # what you'll say (two or three words work best); | between phrases for either
@@ -213,6 +213,17 @@ function Get-AlertView($data, [string]$problem, [string]$name, [datetime]$now) {
   return @{ Notice = $notice; Kind = "alert"; Lines = $lines }
 }
 
+# Stop on the floating button: what to do next. $state is "asked" (the app was told; the page ends the call within a
+# second or two, saves it and closes its window) or "closing" (it didn't, so the window was told to close). $ours: the
+# window is one the listener opened (an app window, so closing it closes nothing else).
+function Get-StopStep([string]$state, [double]$seconds, [bool]$open, [bool]$ours) {
+  if (-not $state) { return "none" }
+  if (-not $open) { return "done" }
+  if ($state -eq "asked") { if ($seconds -lt 4) { return "wait" } elseif ($ours) { return "close" } else { return "give-up" } }
+  if ($state -eq "closing") { if ($seconds -lt 9) { return "wait" } else { return "give-up" } }
+  return "none"
+}
+
 if ($Test) {
   # The window's words for updates and SmokeMonitor (no engine needed).
   $ok = $true
@@ -233,6 +244,13 @@ if ($Test) {
   $v = Get-AlertView $many "" "SmokeMonitor" $t;   $cases += ,@("alerts: many", ($v.Notice + "|" + $v.Lines.Count + "|" + $v.Lines[-1]), "SmokeMonitor: 8 open, worst App 1 (Major)|8|and 2 more")
   $v = Get-AlertView $clear "" "SmokeMonitor" $t;  $cases += ,@("alerts: resolved (gone from the open list)", $v.Notice, "")
   $v = Get-AlertView $null "Project Check-in didn't answer" "SmokeMonitor" $t; $cases += ,@("alerts: app unreachable", ($v.Notice + "|" + ($v.Lines -join "/")), "|#SmokeMonitor/Couldn't check: Project Check-in didn't answer")
+  $cases += ,@("stop: nothing asked", (Get-StopStep "" 1 $true $true), "none")
+  $cases += ,@("stop: window gone, done", (Get-StopStep "asked" 1.5 $false $true), "done")
+  $cases += ,@("stop: waits for the page", (Get-StopStep "asked" 2 $true $true), "wait")
+  $cases += ,@("stop: page didn't, close its window", (Get-StopStep "asked" 4.2 $true $true), "close")
+  $cases += ,@("stop: never closes a window it didn't open", (Get-StopStep "asked" 4.2 $true $false), "give-up")
+  $cases += ,@("stop: closed after closing", (Get-StopStep "closing" 5 $false $true), "done")
+  $cases += ,@("stop: still there after closing", (Get-StopStep "closing" 9.5 $true $true), "give-up")
   foreach ($c in $cases) {
     $good = $c[1] -ceq $c[2]
     "{0,-8} {1}{2}" -f $(if ($good) { "ok" } else { "WRONG" }), $c[0], $(if ($good) { "" } else { "`n         got:      " + $c[1] + "`n         expected: " + $c[2] })
@@ -318,6 +336,7 @@ if ($Test) {
 
 function Open-Assistant {
   $script:openedAt = Get-Date; $script:keepShown = $false
+  $script:ourWindow = [IntPtr]::Zero; $script:trackUntil = (Get-Date).AddSeconds(60)
   if ($env:WAKE_LISTENER_FAKE_MIC) { Write-Host "(test run: the assistant would open now)"; return }
   $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
   $chrome = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -419,6 +438,9 @@ namespace WakeListenerWindows {
     public static bool Visible(IntPtr w) { return w != IntPtr.Zero && IsWindowVisible(w); }
     public static string TitleOf(IntPtr w) { if (w == IntPtr.Zero) return ""; var t = new StringBuilder(512); GetWindowText(w, t, t.Capacity); return t.ToString(); }
     public static void Hide(IntPtr w) { if (w != IntPtr.Zero) ShowWindow(w, 0); }
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr window, uint msg, IntPtr wParam, IntPtr lParam);
+    /// <summary>Asks the window to close (WM_CLOSE), as its X does: no focus needed, works while it's hidden.</summary>
+    public static bool Close(IntPtr w) { return w != IntPtr.Zero && IsWindow(w) && PostMessage(w, 0x0010, IntPtr.Zero, IntPtr.Zero); }
     public static bool Reveal(IntPtr w) { if (w == IntPtr.Zero) return false; ShowWindow(w, IsIconic(w) ? 9 : 5); return SetForegroundWindow(w); }
     public static bool HasWindow(string titlePart) {
       bool found = false;
@@ -750,6 +772,7 @@ function Get-GlanceDetails {
 # Puts the current state on the button.
 function Update-Pill {
   $state, $word = if ($script:updateState -eq "updating") { "updating", ("Updating to " + $script:update.Version + "...") }
+    elseif ($script:stopState) { "connecting", "Stopping..." }
     elseif ($script:setupNeeded) { "setup", "Setting up" }
     elseif ($script:assistantOpen -and $script:onCall) { "open", "On a call" }
     elseif ($script:assistantOpen) { "connecting", "Connecting" }
@@ -758,7 +781,7 @@ function Update-Pill {
     elseif ($script:lastStartError -and -not $script:micName) { "problem", "Engine stopped" }   # a mic, but listen.py failed
     elseif (-not $script:micName -or -not $script:ears) { "setup", "Starting" }
     else { "listening", "Sleeping" }
-  $action = if ($script:setupNeeded -or $state -eq "updating") { "" } elseif ($script:assistantOpen) { "Stop" } else { "Start" }
+  $action = if ($script:setupNeeded -or $state -eq "updating" -or $script:stopState) { "" } elseif ($script:assistantOpen) { "Stop" } else { "Start" }
   $lvl = if ($state -eq "listening") { [int]([Math]::Round([Math]::Min(100, [Math]::Max(0, $script:level)) / 10) * 10) } else { -1 }
   # The notice strip: an update first (it needs him), else an open SmokeMonitor incident.
   if ($script:updateState -eq "updated" -and (Get-Date) -gt $script:updatedUntil) { $script:updateState = $null }
@@ -796,13 +819,22 @@ function Step-Pill {
   if ($script:connectRequested) { $script:connectRequested = $false; Connect-App }
   if ($script:pasteRequested) { $script:pasteRequested = $false; Paste-Key }
   Step-Link
+  Step-Track
   Step-Hide
+  Step-Stop
   Update-Pill
 }
 # Smokey's window hides itself a few seconds after it opens (once the voice has
 # started), so only Floating Smokey shows; he keeps talking. Click the button to
 # show it again. "Show Smokey's window" on the menu turns the hiding off.
 $script:openedAt = $null; $script:keepShown = $false
+$script:ourWindow = [IntPtr]::Zero; $script:trackUntil = [datetime]::MinValue
+# The window the listener just opened (an app window: closing it closes nothing else). Found by its title within a minute.
+function Step-Track {
+  if ($script:ourWindow -ne [IntPtr]::Zero -or (Get-Date) -gt $script:trackUntil) { return }
+  $w = [WakeListenerWindows.Browser]::Find($AssistantTitle)
+  if ($w -ne [IntPtr]::Zero) { $script:ourWindow = $w }
+}
 function Step-Hide {
   if (-not $script:openedAt) { return }
   if ((Get-Setting "hide-window") -eq "no" -or $script:keepShown) { $script:openedAt = $null; return }
@@ -819,14 +851,49 @@ $hideItem = New-Object System.Windows.Forms.MenuItem("Hide Smokey's window while
 $hideItem.Checked = ((Get-Setting "hide-window") -ne "no")
 $hideItem.add_Click({ $this.Checked = -not $this.Checked; Set-Setting "hide-window" $(if ($this.Checked) { "yes" } else { "no" }) })
 
-# Stop: the assistant's page ends the conversation on Escape, exactly as End discussion does.
+# Stop: the listener tells Project Check-in (with its key) to end this person's call. The open page asks once a second,
+# so within a second or two it ends the call exactly as End discussion does: Smokey stops, the session ends, the
+# conversation is saved, the microphone is let go and the window closes. Nothing depends on the window having focus
+# or being shown. If it's still open 4 seconds later, the listener closes its own window (as its X would) and the app
+# saves the call from ElevenLabs instead. A window the listener didn't open is never closed.
+$StopUrl = ($Url -replace "/assistant.*$", "") + "/api/teams/messages/intake/stop"
+$script:stopState = $null; $script:stopAt = [datetime]::MinValue; $script:stopTask = $null
 function Stop-Assistant {
-  if (-not (Test-AssistantOpen)) { return }
-  if (Show-Assistant) {
-    Start-Sleep -Milliseconds 250
-    [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
-    Say "Ending the conversation (the floating button)." Cyan
-  } else { Say "Couldn't reach the assistant's window to end the conversation: use End discussion there." Yellow }
+  if (-not (Test-AssistantOpen) -or $script:stopState) { return }
+  $script:stopState = "asked"; $script:stopAt = Get-Date
+  Say "Stopping the conversation (the floating button)." Cyan
+  $key = Get-Key
+  if ($key) {
+    try {
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      $web = New-Object System.Net.WebClient
+      $web.Headers["Authorization"] = "Bearer $key"; $web.Headers["User-Agent"] = "WakeListener"; $web.Headers["Content-Type"] = "application/json"
+      $script:stopTask = $web.UploadStringTaskAsync($StopUrl, "POST", "{}")
+    } catch { Say ("Couldn't reach Project Check-in to stop it: " + (Why $_)) Yellow }
+  } else {
+    # Not connected to Project Check-in: the page's own Escape, if the window will take it; the close below backs it up.
+    if (Show-Assistant) { Start-Sleep -Milliseconds 250; [System.Windows.Forms.SendKeys]::SendWait("{ESC}") }
+  }
+  Update-Pill
+}
+function Step-Stop {
+  $t = $script:stopTask
+  if ($t -and $t.IsCompleted) {
+    $script:stopTask = $null
+    if ($t.Status -ne "RanToCompletion") { Say ("Project Check-in didn't take the stop (" + $(if ("$($t.Exception.InnerException)" -match "401") { "the key was refused" } else { "no answer" }) + "): closing the window instead.") Yellow; $script:stopAt = (Get-Date).AddSeconds(-4) }
+    $t.Dispose()
+  }
+  if (-not $script:stopState) { return }
+  $ours = $script:ourWindow -ne [IntPtr]::Zero -and [WakeListenerWindows.Browser]::Alive($script:ourWindow, $AssistantTitle)
+  switch (Get-StopStep $script:stopState ((Get-Date) - $script:stopAt).TotalSeconds (Test-AssistantOpen) $ours) {
+    "done" { $script:stopState = $null; Say "Stopped: the conversation ended and was saved." Green }
+    "close" {
+      [void][WakeListenerWindows.Browser]::Close($script:ourWindow)
+      $script:stopState = "closing"
+      Say "The page didn't end it in time: closing Smokey's window (the conversation is still saved)." Yellow
+    }
+    "give-up" { $script:stopState = $null; Say "Couldn't end the conversation from here: use End discussion in Smokey's window." Yellow; [void](Show-Assistant) }
+  }
 }
 function Set-PillShown([bool]$show) {
   $script:pillItem.Text = if ($show) { "Hide floating button" } else { "Show floating button" }
